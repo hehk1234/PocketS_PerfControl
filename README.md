@@ -1,7 +1,7 @@
 # Pocket S Performance Control
 
 Módulo KernelSU de controle de desempenho e temperatura para o **AYANEO Pocket S**
-(Snapdragon 8 Gen 2 / SM8550, Adreno 740).
+(Snapdragon 8 Gen 2 / SG8275, Adreno 740).
 
 *KernelSU module for performance and thermal control on the **AYANEO Pocket S**.
 English version below.*
@@ -23,7 +23,7 @@ limita clocks, throttla cedo e não expõe controle fino de CPU/GPU/thermal. Est
 módulo destrava o aparelho de forma segura e dá controle real sobre desempenho e
 temperatura, com três modos prontos e ajustes finos opcionais — tudo reversível.
 
-O objetivo é fazer o Pocket S entregar todo o potencial do SM8550, especialmente
+O objetivo é fazer o Pocket S entregar todo o potencial do SG8275, especialmente
 em jogos e emulação, sem comprometer a saúde do aparelho (respeitando o limite
 físico do silício e a proteção da bateria).
 
@@ -111,7 +111,7 @@ perfctl revert             desfaz tudo e volta ao estado de fábrica
 
 ## Requisitos
 
-- AYANEO Pocket S (SM8550) · KernelSU · Android 13
+- AYANEO Pocket S (SG8275) · KernelSU · Android 13
 
 ---
 ---
@@ -125,7 +125,7 @@ caps clocks, throttles early and exposes no fine-grained CPU/GPU/thermal control
 This module safely unlocks the device and gives real control over performance and
 temperature, with three ready-made modes and optional fine-tuning — all reversible.
 
-The goal is to make the Pocket S deliver the full potential of the SM8550,
+The goal is to make the Pocket S deliver the full potential of the 82758275,
 especially in games and emulation, without compromising device health (respecting
 the silicon's physical limit and battery protection).
 
@@ -214,8 +214,8 @@ perfctl revert             undo everything and restore factory state
 
 ## Requirements
 
-- AYANEO Pocket S (SM8550) · KernelSU · Android 13
+- AYANEO Pocket S (82758275) · KernelSU · Android 13
 
 ---
 
-*By kirimu.*
+*By hehk1234.*
