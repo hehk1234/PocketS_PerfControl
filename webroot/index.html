@@ -1,0 +1,193 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no,maximum-scale=1.0" />
+<meta name="theme-color" content="#0a0a0a" />
+<title>Pocket S Perf Control</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+
+<header class="hdr">
+  <div class="hdr-line">
+    <span class="hdr-tag">POCKET·S</span>
+    <span class="hdr-divider"></span>
+    <span class="hdr-sub">PERF·CONTROL</span>
+  </div>
+  <div class="hdr-right">
+    <div class="lang-switch" id="langSwitch">
+      <button class="lang-btn" data-lang="pt" id="langPt">PT</button>
+      <button class="lang-btn" data-lang="en" id="langEn">EN</button>
+    </div>
+    <div class="hdr-mode-pill" id="modePill">
+      <span class="dot" id="modeDot"></span>
+      <span id="modePillText">—</span>
+    </div>
+  </div>
+</header>
+
+<main>
+
+<section class="modes">
+  <article class="mode-card" data-mode="0" id="mode0">
+    <span class="mode-num">00</span>
+    <span class="mode-name" data-i18n="mode_standard">Standard</span>
+  </article>
+
+  <article class="mode-card" data-mode="1" id="mode1">
+    <span class="mode-num">01</span>
+    <span class="mode-name" data-i18n="mode_performance">Performance</span>
+  </article>
+
+  <article class="mode-card" data-mode="2" id="mode2">
+    <span class="mode-num">02</span>
+    <span class="mode-name" data-i18n="mode_high">High</span>
+  </article>
+</section>
+
+<section class="thermal">
+  <h2 class="lbl" data-i18n="thermal_label">THERMAL</h2>
+
+  <div class="th-row">
+    <div class="th-head">
+      <span class="th-name">SKIN</span>
+      <span class="th-cur" id="skinCur">— °C</span>
+    </div>
+    <div class="th-control">
+      <input type="range" id="skinSlider" min="46500" max="80000" step="500" value="46500" />
+      <output class="th-val" id="skinVal">50°C</output>
+    </div>
+  </div>
+
+  <div class="th-row">
+    <div class="th-head">
+      <span class="th-name">CPU</span>
+      <span class="th-cur" id="cpuCur">— °C</span>
+    </div>
+    <div class="th-control">
+      <input type="range" id="cpuSlider" min="95000" max="110000" step="1000" value="105000" />
+      <output class="th-val" id="cpuVal">105°C</output>
+    </div>
+  </div>
+
+  <div class="th-row">
+    <div class="th-head">
+      <span class="th-name">GPU</span>
+      <span class="th-cur" id="gpuCur">— °C</span>
+    </div>
+    <div class="th-control">
+      <input type="range" id="gpuSlider" min="90000" max="110000" step="1000" value="105000" />
+      <output class="th-val" id="gpuVal">105°C</output>
+    </div>
+  </div>
+
+  <p class="thermal-auto" data-i18n="thermal_auto_note">Aplicado automaticamente ao alterar.</p>
+</section>
+
+<section class="ramclean">
+  <h2 class="lbl" data-i18n="ramclean_label">RAM CLEANER</h2>
+  <p class="ramclean-desc" data-i18n="ramclean_desc">Limpa pagecache, processos em background e libera RAM.</p>
+  <div class="ramclean-row ramclean-row-single">
+    <button class="btn-ram" id="btnRamClean" data-i18n="ramclean_normal">LIMPAR RAM</button>
+  </div>
+  <p class="ramclean-result" id="ramCleanResult"></p>
+</section>
+
+<section class="limits">
+  <h2 class="lbl" data-i18n="limits_label">LIMITS</h2>
+  <p class="limits-desc" data-i18n="limits_desc">Limites manuais por cluster (sobrescreve o modo).</p>
+
+  <div class="lim-cluster">
+    <h3 class="lim-h" data-i18n="lim_silver">CPU Silver (cpu0-2)</h3>
+    <div class="lim-grid">
+      <label class="lim-lbl" data-i18n="lim_min">MIN</label>
+      <select class="lim-sel" id="limSilverMin" data-field="silver_min"></select>
+      <label class="lim-lbl" data-i18n="lim_max">MAX</label>
+      <select class="lim-sel" id="limSilverMax" data-field="silver_max"></select>
+    </div>
+  </div>
+
+  <div class="lim-cluster">
+    <h3 class="lim-h" data-i18n="lim_gold">CPU Gold (cpu3-6)</h3>
+    <div class="lim-grid">
+      <label class="lim-lbl" data-i18n="lim_min">MIN</label>
+      <select class="lim-sel" id="limGoldMin" data-field="gold_min"></select>
+      <label class="lim-lbl" data-i18n="lim_max">MAX</label>
+      <select class="lim-sel" id="limGoldMax" data-field="gold_max"></select>
+    </div>
+  </div>
+
+  <div class="lim-cluster">
+    <h3 class="lim-h" data-i18n="lim_prime">CPU Prime (cpu7)</h3>
+    <div class="lim-grid">
+      <label class="lim-lbl" data-i18n="lim_min">MIN</label>
+      <select class="lim-sel" id="limPrimeMin" data-field="prime_min"></select>
+      <label class="lim-lbl" data-i18n="lim_max">MAX</label>
+      <select class="lim-sel" id="limPrimeMax" data-field="prime_max"></select>
+    </div>
+  </div>
+
+  <div class="lim-cluster">
+    <h3 class="lim-h" data-i18n="lim_gpu">GPU</h3>
+    <div class="lim-grid">
+      <label class="lim-lbl" data-i18n="lim_min">MIN</label>
+      <select class="lim-sel" id="limGpuMin" data-field="gpu_min"></select>
+      <label class="lim-lbl" data-i18n="lim_max">MAX</label>
+      <select class="lim-sel" id="limGpuMax" data-field="gpu_max"></select>
+    </div>
+  </div>
+
+  <div class="lim-buttons">
+    <button class="btn-lim btn-lim-reset" id="btnLimReset" data-i18n="lim_reset">RESET</button>
+  </div>
+  <p class="limits-auto" data-i18n="limits_auto_note">Aplicado automaticamente ao alterar.</p>
+</section>
+
+<section class="experimental" id="expSection">
+  <h2 class="lbl" data-i18n="exp_label">EXPERIMENTAL</h2>
+  <div class="exp-row">
+    <div class="exp-info">
+      <span class="exp-title" data-i18n="exp_950_title">GPU 950MHz</span>
+      <span class="exp-desc" id="expDesc" data-i18n="exp_950_desc">Limita a GPU a 950MHz no modo High (voltagem menor, mais energia para a CPU). Requer dtbo com o nivel de 950MHz.</span>
+    </div>
+    <label class="exp-switch">
+      <input type="checkbox" id="expToggle" />
+      <span class="exp-slider"></span>
+    </label>
+  </div>
+  <p class="exp-status" id="expStatus"></p>
+</section>
+
+<section class="adv">
+  <button class="btn-line" id="btnRevert" data-i18n="restore_original">RESTAURAR ORIGINAL</button>
+  <button class="btn-line" id="btnLog" data-i18n="view_log">VER LOG</button>
+</section>
+
+<details class="logbox" id="logBox">
+  <summary>log</summary>
+  <pre id="logContent">—</pre>
+</details>
+
+</main>
+
+<footer class="ftr">
+  <span>by kirimu</span>
+  <span id="appVersion">v2.4.9</span>
+</footer>
+
+<div class="modal-overlay" id="confirmModal">
+  <div class="modal-box">
+    <p class="modal-msg" id="confirmMsg"></p>
+    <div class="modal-actions">
+      <button class="modal-btn modal-cancel" id="confirmCancel" data-i18n="modal_cancel">Cancelar</button>
+      <button class="modal-btn modal-ok" id="confirmOk" data-i18n="modal_ok">Confirmar</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

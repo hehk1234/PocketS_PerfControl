@@ -1,0 +1,1976 @@
+#!/system/bin/sh
+# perfctl — engine principal do Pocket S Performance Control
+
+MODID="pockets_perfcontrol"
+MODPATH="/data/adb/modules/${MODID}"
+STATEDIR="/data/adb/${MODID}"
+LOGFILE="${STATEDIR}/perfctl.log"
+MODEFILE="${STATEDIR}/current_mode"
+ORIGFILE="${STATEDIR}/original_state.snapshot"
+KEEPER_PID="${STATEDIR}/keeper.pid"
+CDEV_CACHE="${STATEDIR}/cdev_throttle.cache"
+MODES_CONF="${MODPATH}/etc/modes.conf"
+THERMAL_CONF="${MODPATH}/etc/thermal.conf"
+USER_LIMITS_CONF="${MODPATH}/etc/user_limits.conf"
+# Toggle "experimental": habilita o pwrlevel custom de 950MHz (so funciona se o
+# usuario flashou o dtbo via KonaBess). Persistido em arquivo de estado (gravavel),
+# nao no etc/ (que e read-only quando o modulo esta montado).
+EXPERIMENTAL_FILE="${STATEDIR}/experimental"
+
+mkdir -p "$STATEDIR" 2>/dev/null
+chmod 0700 "$STATEDIR" 2>/dev/null
+
+LOG_MAX_BYTES=262144
+
+# Lista de processos Winlator/Wine que pinaremos no cluster gold+prime
+WINLATOR_PATTERNS="MOHW|MOHA|wine|wineserver|winhandler|box64|box86|dxvk|d3d|proton|winedevice"
+
+# --- Util ---
+
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') | $$ | $*" >> "$LOGFILE" 2>/dev/null
+  if [ -f "$LOGFILE" ]; then
+    sz=$(stat -c %s "$LOGFILE" 2>/dev/null || echo 0)
+    if [ "$sz" -gt "$LOG_MAX_BYTES" ]; then
+      mv "$LOGFILE" "${LOGFILE}.old" 2>/dev/null
+    fi
+  fi
+}
+
+# Silencioso: nao loga sucesso, so falha grave.
+write_sys() {
+  v="$1"; p="$2"
+  [ -z "$v" ] && return 0
+  [ ! -e "$p" ] && return 1
+  # skip-if-unchanged
+  cur=$(cat "$p" 2>/dev/null)
+  [ "$cur" = "$v" ] && return 0
+  [ ! -w "$p" ] && chmod 0664 "$p" 2>/dev/null
+  # Subshell para capturar erro do redirect (Permission denied vaza de echo>file)
+  (echo "$v" > "$p") 2>/dev/null
+}
+
+# Loud: loga ok e falha — usar em apply_mode (one-shot, vale a pena logar)
+write_sys_loud() {
+  v="$1"; p="$2"
+  [ -z "$v" ] && return 0
+  [ ! -e "$p" ] && { log "skip(nao existe): $p"; return 1; }
+  cur=$(cat "$p" 2>/dev/null)
+  if [ "$cur" = "$v" ]; then
+    return 0    # sem log — barulho desnecessario
+  fi
+  [ ! -w "$p" ] && chmod 0664 "$p" 2>/dev/null
+  if (echo "$v" > "$p") 2>/dev/null; then
+    log "ok: $p <- $v"
+    return 0
+  else
+    log "FAIL: $p <- $v"
+    return 1
+  fi
+}
+
+read_sys() { [ -e "$1" ] && cat "$1" 2>/dev/null; }
+
+get_conf() {
+  awk -F= -v k="$2" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$1" 2>/dev/null
+}
+
+# --- Localizar zone do skin ---
+
+find_skin_zone() {
+  # Retorna o numero da zona skin-msm-therm (ex: 92).
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -e "$z/type" ] || continue
+    if [ "$(cat "$z/type" 2>/dev/null)" = "skin-msm-therm" ]; then
+      echo "${z##*thermal_zone}"
+      return 0
+    fi
+  done
+}
+
+# Retorna o trip de throttling editavel do skin.
+# No Pocket S: trip_point_0=125000 (protecao), trip_point_1=throttling (este).
+find_skin_trip() {
+  local zone="$1"
+  [ -z "$zone" ] && return 1
+  local base="/sys/class/thermal/thermal_zone${zone}"
+  if [ -e "${base}/trip_point_1_temp" ]; then
+    echo "${base}/trip_point_1_temp"
+    return 0
+  fi
+  # Fallback: menor trip > 0 e < 110C (caso a estrutura mude).
+  local best_idx="" best_val=99999999
+  local i=0
+  while [ $i -le 12 ]; do
+    local f="${base}/trip_point_${i}_temp"
+    if [ -e "$f" ]; then
+      local v
+      v=$(cat "$f" 2>/dev/null)
+      if [ -n "$v" ] && [ "$v" -gt 0 ] 2>/dev/null && [ "$v" -lt 110000 ] 2>/dev/null; then
+        [ "$v" -lt "$best_val" ] 2>/dev/null && { best_val="$v"; best_idx="$i"; }
+      fi
+    fi
+    i=$((i + 1))
+  done
+  [ -n "$best_idx" ] && echo "${base}/trip_point_${best_idx}_temp" && return 0
+  echo "${base}/trip_point_0_temp"
+}
+
+# --- Snapshot do estado de fabrica ---
+
+snapshot_original() {
+  [ -f "$ORIGFILE" ] && return 0
+  log "criando snapshot do estado original"
+  # Garante cache de zones (sao usadas abaixo)
+  build_zone_cache
+  {
+    echo "# Snapshot pre-modificacao — $(date)"
+    for p in 0 3 7; do
+      echo "CPU${p}_MIN_ORIG=$(read_sys /sys/devices/system/cpu/cpu${p}/cpufreq/scaling_min_freq)"
+      echo "CPU${p}_MAX_ORIG=$(read_sys /sys/devices/system/cpu/cpu${p}/cpufreq/scaling_max_freq)"
+    done
+    echo "GPU_MIN_ORIG=$(read_sys /sys/class/kgsl/kgsl-3d0/devfreq/min_freq)"
+    echo "GPU_MAX_ORIG=$(read_sys /sys/class/kgsl/kgsl-3d0/devfreq/max_freq)"
+    echo "GPU_GOV_ORIG=$(read_sys /sys/class/kgsl/kgsl-3d0/devfreq/governor)"
+    echo "GPU_DEFPWR_ORIG=$(read_sys /sys/class/kgsl/kgsl-3d0/default_pwrlevel)"
+    echo "GPU_MAXPWR_ORIG=$(read_sys /sys/class/kgsl/kgsl-3d0/max_pwrlevel)"
+    echo "GPU_MINPWR_ORIG=$(read_sys /sys/class/kgsl/kgsl-3d0/min_pwrlevel)"
+    echo "GPU_FORCENONAP_ORIG=$(read_sys /sys/class/kgsl/kgsl-3d0/force_no_nap)"
+    echo "GPU_IDLETIMER_ORIG=$(read_sys /sys/class/kgsl/kgsl-3d0/idle_timer)"
+
+    # Skin trip — sem cache, localiza na hora
+    szn=$(find_skin_zone)
+    if [ -n "$szn" ]; then
+      echo "SKIN_TRIP_ORIG=$(read_sys "$(find_skin_trip "$szn")")"
+    fi
+
+    # GPU trips — pega da PRIMEIRA zone GPU em cache (gpuss-0)
+    if [ -s "$ZONECACHE_GPU" ]; then
+      gz=$(head -1 "$ZONECACHE_GPU")
+      [ -n "$gz" ] && {
+        echo "GPU_TRIP1_ORIG=$(read_sys $gz/trip_point_1_temp)"
+        echo "GPU_TRIP2_ORIG=$(read_sys $gz/trip_point_2_temp)"
+      }
+    fi
+    # CPU trips — primeira CPU zone em cache (cpu-0-0 ou cpu-1-0)
+    if [ -s "$ZONECACHE_CPU" ]; then
+      cz=$(head -1 "$ZONECACHE_CPU")
+      [ -n "$cz" ] && {
+        echo "CPU_TRIP1_ORIG=$(read_sys $cz/trip_point_1_temp)"
+        echo "CPU_TRIP2_ORIG=$(read_sys $cz/trip_point_2_temp)"
+      }
+    fi
+    echo "SCHED_EAS_ORIG=$(read_sys /proc/sys/kernel/sched_energy_aware)"
+    echo "SCHED_PELT_ORIG=$(read_sys /proc/sys/kernel/sched_pelt_multiplier)"
+    echo "TOPAPP_CPUS_ORIG=$(read_sys /dev/cpuset/top-app/cpus)"
+    echo "FOREGROUND_CPUS_ORIG=$(read_sys /dev/cpuset/foreground/cpus)"
+  } > "$ORIGFILE"
+}
+
+# --- Aplicar CPU cluster ---
+
+apply_cluster() {
+  local p="$1" v_min="$2" v_max="$3"
+  [ -z "$v_min" ] && [ -z "$v_max" ] && return 0
+  local base="/sys/devices/system/cpu/cpu${p}/cpufreq"
+
+  if [ -n "$v_max" ]; then
+    # Turbo states (cpu3=2803200, cpu7=3360000) NAO estao em
+    # scaling_available_frequencies — sao "boost frequencies". O cpufreq core
+    # SO permite escrever esses valores no scaling_max se o boost estiver ligado;
+    # senao clampa pro maior step normal (2707200 / 2956800).
+    # Por isso: ligar boost ANTES de escrever o max.
+    local cpuinfo_max
+    cpuinfo_max=$(cat "${base}/cpuinfo_max_freq" 2>/dev/null)
+    if [ -n "$cpuinfo_max" ] && [ -n "$v_max" ] && [ "$v_max" -ge "$cpuinfo_max" ] 2>/dev/null; then
+      # Pedindo o topo (turbo) — garantir boost ligado
+      write_sys "1" /sys/devices/system/cpu/cpufreq/boost
+      write_sys "1" "${base}/cpufreq/boost" 2>/dev/null
+    fi
+
+    # Baixar scaling_min antes (evita min>max momentaneo travar a escrita)
+    local cpuinfo_min
+    cpuinfo_min=$(cat "${base}/cpuinfo_min_freq" 2>/dev/null)
+    [ -n "$cpuinfo_min" ] && write_sys "$cpuinfo_min" "${base}/scaling_min_freq"
+
+    write_sys_loud "$v_max" "${base}/scaling_max_freq"
+
+    # Verificar se pegou; se nao, ligar boost (global) e re-escrever
+    local got
+    got=$(cat "${base}/scaling_max_freq" 2>/dev/null)
+    if [ "$got" != "$v_max" ]; then
+      write_sys "1" /sys/devices/system/cpu/cpufreq/boost
+      write_sys_loud "$v_max" "${base}/scaling_max_freq"
+      got=$(cat "${base}/scaling_max_freq" 2>/dev/null)
+      [ "$got" != "$v_max" ] && log "cpu${p}: scaling_max pedido=$v_max efetivo=$got"
+    fi
+  fi
+
+  [ -n "$v_min" ] && write_sys_loud "$v_min" "${base}/scaling_min_freq"
+}
+
+# --- Deteccao dinamica da tabela de pwrlevels da GPU ---
+# A tabela do KGSL vai de 0 (mais rapido) a N (mais lento). Lemos
+# available_frequencies em runtime em vez de chumbar indices, pra funcionar tanto
+# no stock (15 niveis) quanto com o 950MHz flashado (16 niveis).
+
+GPU_FREQS_CACHE=""
+
+# Retorna a lista de frequencias (uma por linha), ordenada do MAIOR pro MENOR,
+# que e a ordem dos pwrlevels (pwrlevel 0 = maior freq).
+gpu_freq_list() {
+  if [ -z "$GPU_FREQS_CACHE" ]; then
+    local raw
+    raw=$(cat /sys/class/kgsl/kgsl-3d0/devfreq/available_frequencies 2>/dev/null)
+    [ -z "$raw" ] && return 1
+    # available_frequencies vem em ordem CRESCENTE (menor->maior); invertemos
+    # pra bater com a ordem dos pwrlevels (0=maior).
+    GPU_FREQS_CACHE=$(echo "$raw" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -rn)
+  fi
+  echo "$GPU_FREQS_CACHE"
+}
+
+# gpu_pwrlevel_of_freq <freq_hz> — retorna o INDICE de pwrlevel de uma frequencia
+# (0-based, contando do maior pro menor). Vazio se a freq nao existe na tabela.
+gpu_pwrlevel_of_freq() {
+  local target="$1" idx=0
+  [ -z "$target" ] && return 1
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    if [ "$f" = "$target" ]; then
+      echo "$idx"
+      return 0
+    fi
+    idx=$((idx + 1))
+  done <<EOF
+$(gpu_freq_list)
+EOF
+  return 1
+}
+
+# gpu_pwrlevel_max — indice do nivel mais lento (= ultimo da lista = N-1).
+gpu_pwrlevel_max() {
+  local n
+  n=$(gpu_freq_list | grep -c '^[0-9]')
+  [ "$n" -gt 0 ] 2>/dev/null && echo $((n - 1))
+}
+
+# gpu_pwrlevel_idle — indice do nivel de repouso (idle). No stock e ~220MHz
+# (indice 13 de 15). Localizamos por VALOR: a maior freq <= 250MHz (o ponto de
+# descanso natural). Se nao achar, cai pro penultimo nivel.
+gpu_pwrlevel_idle() {
+  local idx=0 best=""
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    # primeiro nivel (do topo) cuja freq seja <= 250000000 (250MHz)
+    if [ "$f" -le 250000000 ] 2>/dev/null; then
+      best="$idx"
+      break
+    fi
+    idx=$((idx + 1))
+  done <<EOF
+$(gpu_freq_list)
+EOF
+  if [ -n "$best" ]; then
+    echo "$best"
+  else
+    # fallback: penultimo nivel
+    local mx
+    mx=$(gpu_pwrlevel_max)
+    [ -n "$mx" ] && [ "$mx" -gt 0 ] 2>/dev/null && echo $((mx - 1)) || echo "$mx"
+  fi
+}
+
+# --- Toggle experimental (950MHz) ---
+
+# experimental_on — retorna 0 (true) se o toggle esta ligado, 1 caso contrario.
+experimental_on() {
+  [ -f "$EXPERIMENTAL_FILE" ] && [ "$(cat "$EXPERIMENTAL_FILE" 2>/dev/null)" = "1" ]
+}
+
+# gpu_has_950 — retorna 0 (true) se a frequencia de 950MHz existe na tabela
+# (ou seja, o usuario flashou o dtbo com o nivel custom).
+gpu_has_950() {
+  gpu_freq_list | grep -q '^950000000$'
+}
+
+# gpu_950_active — retorna 0 (true) SO se experimental ligado E 950 presente.
+# E a guarda unica que decide se usamos o 950 em qualquer lugar.
+gpu_950_active() {
+  experimental_on && gpu_has_950
+}
+
+# --- Aplicar GPU em modo "lock" (robusto, varios mecanismos) ---
+
+apply_gpu_lock() {
+  local gmin="$1" gmax="$2" lock_mode="$3"
+  # lock_mode = 1 => trava na freq max; 0 => libera (oscila min..max)
+  # Indices de pwrlevel descobertos dinamicamente (robusto a tabela custom).
+  local pl_idle pl_min
+  pl_idle=$(gpu_pwrlevel_idle); [ -z "$pl_idle" ] && pl_idle=13
+  pl_min=$(gpu_pwrlevel_max);   [ -z "$pl_min" ] && pl_min=14
+
+  if [ "$lock_mode" = "1" ]; then
+    # Lock mode: trava em pwrlevel 0 (= max freq)
+    write_sys_loud "$gmax" /sys/class/kgsl/kgsl-3d0/devfreq/max_freq
+    write_sys_loud "$gmin" /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+    write_sys_loud "0" /sys/class/kgsl/kgsl-3d0/min_pwrlevel
+    write_sys_loud "0" /sys/class/kgsl/kgsl-3d0/max_pwrlevel
+    write_sys_loud "0" /sys/class/kgsl/kgsl-3d0/default_pwrlevel
+    write_sys_loud "0" /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel
+    write_sys_loud "1" /sys/class/kgsl/kgsl-3d0/force_no_nap
+    write_sys_loud "1" /sys/class/kgsl/kgsl-3d0/force_clk_on
+    write_sys_loud "10000000" /sys/class/kgsl/kgsl-3d0/idle_timer
+    pin_cdevs_zero
+  else
+    # Modo livre: GPU oscila entre min e max conforme demanda.
+    # CRITICO: a ordem importa no devfreq (min<=max sempre). Como vamos de um
+    # estado possivelmente travado (HIGH deixou min=1G e default_pwrlevel=0),
+    # primeiro liberamos os pwrlevels, depois baixamos o min do devfreq.
+    write_sys "$pl_min" /sys/class/kgsl/kgsl-3d0/min_pwrlevel    # nivel mais lento (124.8MHz)
+    write_sys "0"  /sys/class/kgsl/kgsl-3d0/max_pwrlevel         # nivel mais rapido
+    write_sys "0"  /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel     # sem throttle termico preso
+    # default_pwrlevel: ONDE a GPU repousa quando idle. HIGH deixa em 0 (=topo),
+    # o que trava a GPU no maximo no launcher. Restauramos pra um nivel medio-baixo
+    # (~220MHz) pra GPU poder descansar — ela sobe sob demanda via governor.
+    write_sys "$pl_idle" /sys/class/kgsl/kgsl-3d0/default_pwrlevel
+    write_sys "0"  /sys/class/kgsl/kgsl-3d0/force_no_nap         # GPU pode dormir
+    write_sys "0"  /sys/class/kgsl/kgsl-3d0/force_clk_on         # nao forca clock ligado
+    write_sys "64" /sys/class/kgsl/kgsl-3d0/idle_timer           # idle timer = 64ms (default)
+    # devfreq min/max — baixar min ANTES de mexer no max evita travar no topo
+    if [ -n "$gmin" ]; then
+      write_sys_loud "$gmin" /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+    fi
+    if [ -n "$gmax" ]; then
+      write_sys_loud "$gmax" /sys/class/kgsl/kgsl-3d0/devfreq/max_freq
+    fi
+    # Garantir que o governor de devfreq esta ativo (msm-adreno-tz), senao a GPU
+    # fica presa no ultimo pwrlevel forcado pelo HIGH.
+    write_sys "msm-adreno-tz" /sys/class/kgsl/kgsl-3d0/devfreq/governor 2>/dev/null
+  fi
+}
+
+# --- Cache de thermal zones e cooling devices ---
+
+ZONECACHE_GPU="${STATEDIR}/zones_gpu.cache"
+ZONECACHE_CPU="${STATEDIR}/zones_cpu.cache"
+ZONECACHE_SKIN="${STATEDIR}/zone_skin.cache"
+CDEVCACHE_CRITICAL="${STATEDIR}/cdevs_critical.cache"
+CDEVCACHE_PAUSE="${STATEDIR}/cdevs_pause.cache"
+
+build_zone_cache() {
+  [ -s "$ZONECACHE_GPU" ] && [ -s "$ZONECACHE_CPU" ] && \
+  [ -s "$ZONECACHE_SKIN" ] && [ -s "$CDEVCACHE_CRITICAL" ] && [ -s "$CDEVCACHE_PAUSE" ] && return 0
+
+  log "construindo cache de thermal zones + cdevs..."
+  : > "$ZONECACHE_GPU"
+  : > "$ZONECACHE_CPU"
+  : > "$ZONECACHE_SKIN"
+  : > "$CDEVCACHE_CRITICAL"
+  : > "$CDEVCACHE_PAUSE"
+
+  # Thermal zones
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -e "$z/type" ] || continue
+    t=$(cat "$z/type" 2>/dev/null)
+    case "$t" in
+      gpuss-*)            echo "$z" >> "$ZONECACHE_GPU" ;;
+      cpu-1-*|cpu-0-*)    echo "$z" >> "$ZONECACHE_CPU" ;;
+      skin-msm-therm)     echo "$z" > "$ZONECACHE_SKIN" ;;
+    esac
+  done
+
+  # Cooling devices — split em CRITICAL (cpufreq + cluster + gpu) vs PAUSE (pause-* + hotplug)
+  # Skipados: pwm-fan (ventoinha — deixar trabalhar), backlight, ufs, battery, wsa, cdsp
+  for cd in /sys/class/thermal/cooling_device*; do
+    [ -e "$cd/type" ] || continue
+    t=$(cat "$cd/type" 2>/dev/null)
+    case "$t" in
+      cpufreq-cpu*|cpu-cluster*|thermal-cluster-*|devfreq-*kgsl-3d0*|gpu|ddr-cdev)
+        echo "$cd" >> "$CDEVCACHE_CRITICAL"
+        ;;
+      pause-cpu*|thermal-pause-*|cpu-hotplug*|display-fps)
+        echo "$cd" >> "$CDEVCACHE_PAUSE"
+        ;;
+    esac
+  done
+
+  log "cache: $(wc -l < $ZONECACHE_GPU) gpu, $(wc -l < $ZONECACHE_CPU) cpu zones, $(wc -l < $CDEVCACHE_CRITICAL) crit cdevs, $(wc -l < $CDEVCACHE_PAUSE) pause cdevs"
+}
+
+pin_cdevs_critical() {
+  [ ! -s "$CDEVCACHE_CRITICAL" ] && return 0
+  while IFS= read -r cd; do
+    [ -z "$cd" ] && continue
+    write_sys "0" "$cd/cur_state"
+  done < "$CDEVCACHE_CRITICAL"
+}
+
+# Zera os pause-* — chamada esporadica (so quando sob pressao termica)
+pin_cdevs_pause() {
+  [ ! -s "$CDEVCACHE_PAUSE" ] && return 0
+  while IFS= read -r cd; do
+    [ -z "$cd" ] && continue
+    write_sys "0" "$cd/cur_state"
+  done < "$CDEVCACHE_PAUSE"
+}
+
+# Zera AMBOS (usar em apply_mode_values, one-shot)
+pin_cdevs_zero() {
+  pin_cdevs_critical
+  pin_cdevs_pause
+}
+
+apply_auto_trips() {
+  local gpu_t="$1" cpu_t="$2"
+  build_zone_cache
+
+  if [ -n "$gpu_t" ] && [ -s "$ZONECACHE_GPU" ]; then
+    while IFS= read -r z; do
+      [ -z "$z" ] && continue
+      write_sys "$gpu_t" "$z/trip_point_1_temp"
+      write_sys "$gpu_t" "$z/trip_point_2_temp"
+    done < "$ZONECACHE_GPU"
+  fi
+
+  if [ -n "$cpu_t" ] && [ -s "$ZONECACHE_CPU" ]; then
+    while IFS= read -r z; do
+      [ -z "$z" ] && continue
+      write_sys "$cpu_t" "$z/trip_point_1_temp"
+      write_sys "$cpu_t" "$z/trip_point_2_temp"
+    done < "$ZONECACHE_CPU"
+  fi
+}
+
+# --- Affinity / cpuset top-app ---
+
+apply_cpuset() {
+  local cpus="$1"  # "0-7" (default) ou "3-7" (sem silver). "default" = restaura
+  if [ -z "$cpus" ] || [ "$cpus" = "default" ]; then
+    # restaura ao padrao Android (todos os cores no top-app)
+    write_sys_loud "0-7" /dev/cpuset/top-app/cpus
+    write_sys_loud "0-7" /dev/cpuset/foreground/cpus
+    return 0
+  fi
+  write_sys_loud "$cpus" /dev/cpuset/top-app/cpus
+  write_sys_loud "$cpus" /dev/cpuset/foreground/cpus
+}
+
+apply_bg_cpusets() {
+  local bg_cpus="$1"  # "0-2" no high, vazio/default = restaurar
+  if [ -z "$bg_cpus" ] || [ "$bg_cpus" = "default" ]; then
+    # restaura ao padrao Android (todos os cores para tasks bg)
+    write_sys_loud "0-7" /dev/cpuset/background/cpus
+    write_sys_loud "0-7" /dev/cpuset/system-background/cpus
+    write_sys_loud "0-7" /dev/cpuset/restricted/cpus
+    return 0
+  fi
+  write_sys_loud "$bg_cpus" /dev/cpuset/background/cpus
+  write_sys_loud "$bg_cpus" /dev/cpuset/system-background/cpus
+  write_sys_loud "$bg_cpus" /dev/cpuset/restricted/cpus
+}
+
+apply_core_ctl() {
+  local mode="$1"  # "high" | "perf" | ""
+
+  case "$mode" in
+    high)
+      write_sys_loud "1" /sys/devices/system/cpu/cpu3/core_ctl/enable
+      write_sys_loud "1" /sys/devices/system/cpu/cpu7/core_ctl/enable
+      # not_preferred=0 0 0 0: libera cpu5/cpu6 (vendor seta 0 0 1 1 = evita)
+      write_sys_loud "0 0 0 0" /sys/devices/system/cpu/cpu3/core_ctl/not_preferred
+      # busy_up=1, busy_down=0: ativa cores com qualquer carga, nunca pausa por busy%
+      write_sys "0" /sys/devices/system/cpu/cpu3/core_ctl/busy_down_thres
+      write_sys "1" /sys/devices/system/cpu/cpu3/core_ctl/busy_up_thres
+      write_sys "0" /sys/devices/system/cpu/cpu7/core_ctl/busy_down_thres
+      write_sys "1" /sys/devices/system/cpu/cpu7/core_ctl/busy_up_thres
+      # task_thres: cpu3=4 (gold, 4 cores), cpu7=1 (prime, 1 core)
+      write_sys "4" /sys/devices/system/cpu/cpu3/core_ctl/task_thres
+      write_sys "1" /sys/devices/system/cpu/cpu7/core_ctl/task_thres
+      # offline_delay=5000: core fica 5s online antes de pausar
+      write_sys "5000" /sys/devices/system/cpu/cpu3/core_ctl/offline_delay_ms
+      write_sys "5000" /sys/devices/system/cpu/cpu7/core_ctl/offline_delay_ms
+      ;;
+    perf)
+      # PERF: limpa not_preferred, mas mantem o resto vendor
+      write_sys "0 0 0 0" /sys/devices/system/cpu/cpu3/core_ctl/not_preferred
+      ;;
+    *)
+      # BALANCED — restaurar tudo ao padrao vendor (estado de fabrica do Pocket S).
+      write_sys_loud "1" /sys/devices/system/cpu/cpu3/core_ctl/enable
+      write_sys_loud "1" /sys/devices/system/cpu/cpu7/core_ctl/enable
+      write_sys_loud "0 0 1 1" /sys/devices/system/cpu/cpu3/core_ctl/not_preferred
+      write_sys "60" /sys/devices/system/cpu/cpu3/core_ctl/busy_up_thres
+      write_sys "30" /sys/devices/system/cpu/cpu3/core_ctl/busy_down_thres
+      write_sys "60" /sys/devices/system/cpu/cpu7/core_ctl/busy_up_thres
+      write_sys "30" /sys/devices/system/cpu/cpu7/core_ctl/busy_down_thres
+      write_sys "4" /sys/devices/system/cpu/cpu3/core_ctl/task_thres
+      write_sys "1" /sys/devices/system/cpu/cpu7/core_ctl/task_thres
+      write_sys "100" /sys/devices/system/cpu/cpu3/core_ctl/offline_delay_ms
+      write_sys "100" /sys/devices/system/cpu/cpu7/core_ctl/offline_delay_ms
+      ;;
+  esac
+}
+
+reapply_core_ctl_keeper() {
+  write_sys "0 0 0 0" /sys/devices/system/cpu/cpu3/core_ctl/not_preferred
+  write_sys "1" /sys/devices/system/cpu/cpu3/core_ctl/busy_up_thres
+  write_sys "0" /sys/devices/system/cpu/cpu3/core_ctl/busy_down_thres
+}
+
+# Quando MTP conecta/desconecta, vendor reseta os cdevs thermal-cluster e
+# o dcvsh_freq_limit dos cores grandes — fazendo prime cair pra 2.9 e gold pra 2.7.
+# Detectamos e revertemos a cada poll do keeper, independente do modo.
+reapply_mtp_fix() {
+  # Pocket S MTP/USB connection bug: vendor seta cdevs que reduzem scaling_max:
+  #   - cpufreq-cpu3 (cdev1)  → 1 step abaixo = 2707200 (gold cai de 2.8 -> 2.7)
+  #   - cpufreq-cpu7 (cdev2)  → 1 step abaixo = 2956800 (prime cai de 3.36 -> 2.9)
+  #   - cpu-cluster1/2 (cdev32/33), thermal-cluster-1-2 (cdev29)
+  #   - thermal-pause-cpu* — pode pausar cores fisicos
+  # Zeramos TODOS preventivamente.
+  for cd in /sys/class/thermal/cooling_device*; do
+    [ -e "$cd/type" ] || continue
+    case "$(cat "$cd/type" 2>/dev/null)" in
+      cpufreq-cpu3|cpufreq-cpu7|\
+      cpu-cluster1|cpu-cluster2|\
+      thermal-cluster-1-*|thermal-cluster-2-*|\
+      thermal-pause-cpu3|thermal-pause-cpu4|thermal-pause-cpu5|\
+      thermal-pause-cpu6|thermal-pause-cpu7|\
+      pause-cpu3|pause-cpu4|pause-cpu5|pause-cpu6|pause-cpu7)
+        write_sys "0" "$cd/cur_state"
+        ;;
+    esac
+  done
+  # dcvsh_freq_limit (read-only em alguns kernels — write_sys silencia falha)
+  write_sys "2803200" /sys/devices/system/cpu/cpu3/dcvsh_freq_limit
+  write_sys "3360000" /sys/devices/system/cpu/cpu7/dcvsh_freq_limit
+}
+
+# Detecta se ha gravacao de tela / captura ativa. Esses servicos remapeiam o
+# cpuset top-app e a afinidade dos processos pra liberar cores pro encoder,
+# e NAO restauram ao terminar — deixando o jogo presos em menos cores (FPS cai
+# e nao volta). Detectamos pra forcar o reapego.
+screen_recording_active() {
+  # 1) processos de captura/encode (cobre gravador nativo + apps de terceiros)
+  pgrep -f "screenrecord|MediaProjection|scrcpy" >/dev/null 2>&1 && return 0
+  # 2) gravador NATIVO do Android: roda via system_server + media.codec/codec2.
+  #    Detectamos a sessao ativa de MediaProjection (a forma mais confiavel).
+  if dumpsys media_projection 2>/dev/null | grep -qiE "ProjectionToken|isValid=true|active.*true"; then
+    return 0
+  fi
+  # 3) fallback: servico de captura do SystemUI ativo (ScreenRecord no Android 13)
+  dumpsys activity services 2>/dev/null | grep -qi "RecordingService\|ScreenRecord" && return 0
+  return 1
+}
+
+# Reapega a afinidade do app em foreground aos cores do modo. Diferente do
+# pin_winlator (que so cobre padroes Winlator), isto cobre QUALQUER app pesado
+# em foreground (Eden, AetherSX2, etc) — essencial pra recuperar a afinidade
+# que a gravacao de tela rouba. Pega os PIDs no cpuset top-app e repina TIDs.
+reassert_foreground_affinity() {
+  local cpus="$1"   # mascara hex: "f8"=3-7, "ff"=0-7
+  [ -z "$cpus" ] && return 0
+  # 1) Restaurar a JANELA do cpuset top-app/foreground (a gravacao a encolhe).
+  #    "$cset" vem do modo; default 0-7.
+  local cset="${2:-0-7}"
+  write_sys "$cset" /dev/cpuset/top-app/cpus
+  write_sys "$cset" /dev/cpuset/foreground/cpus
+  # 2) Reapegar afinidade (taskset) dos processos do app em foreground.
+  local tasklist="/dev/cpuset/top-app/tasks"
+  [ -f "$tasklist" ] || return 0
+  local n=0
+  while IFS= read -r pid; do
+    [ -d "/proc/$pid" ] || continue
+    taskset -ap "$cpus" "$pid" >/dev/null 2>&1 && n=$((n+1))
+    if [ -d "/proc/$pid/task" ]; then
+      for td in /proc/$pid/task/*; do
+        tid="${td##*/}"; [ -d "$td" ] || continue
+        taskset -ap "$cpus" "$tid" >/dev/null 2>&1
+      done
+    fi
+  done < "$tasklist"
+  [ "$n" -gt 0 ] && log "afinidade foreground reapegada: $n pids em cpus=$cpus (cpuset=$cset)"
+}
+
+# current_topapp_cpus — janela de cpus do top-app pro modo atual.
+# Standard (vendor puro) = 0-7; senao le do modes.conf.
+current_topapp_cpus() {
+  local m prefix v
+  m=$(cat "$MODEFILE" 2>/dev/null); [ -z "$m" ] && m=0
+  case "$m" in 0) prefix=BALANCED ;; 1) prefix=PERF ;; 2) prefix=HIGH ;; *) prefix=BALANCED ;; esac
+  v=$(get_conf "$MODES_CONF" "${prefix}_TOPAPP_CPUS")
+  case "$v" in ""|default) echo "0-7" ;; *) echo "$v" ;; esac
+}
+
+# cpus_to_mask — "0-7"->ff, "3-7"->f8 (hex pro taskset).
+cpus_to_mask() {
+  case "$1" in
+    3-7) echo "f8" ;;
+    *) echo "ff" ;;
+  esac
+}
+
+# --- Monitor de gravacao de tela (independente do keeper) ---
+# Roda em TODOS os modos, inclusive Standard (vendor-puro, sem keeper). A gravacao
+# nativa do Android (MediaProjection/media.codec) encolhe o cpuset top-app +
+# remapeia a afinidade dos processos do jogo pra liberar cores pro encoder, e NAO
+# restaura ao terminar (FPS cai e nao volta, as vezes so reiniciando). Este monitor
+# detecta a gravacao e, durante E depois, forca cpuset + afinidade de volta.
+# Leve: so trabalha quando ha gravacao ou logo apos; em idle dorme 2s.
+RECMON_PID="$STATEDIR/recmon.pid"
+
+recmon_loop() {
+  echo $$ > "$RECMON_PID"
+  trap 'rm -f "$RECMON_PID"; exit 0' INT TERM
+  log "recmon iniciado pid=$$"
+  local was_active=0 cset mask i
+  while true; do
+    if screen_recording_active; then
+      was_active=1
+      cset=$(current_topapp_cpus); mask=$(cpus_to_mask "$cset")
+      reassert_foreground_affinity "$mask" "$cset"
+      sleep 1
+    elif [ "$was_active" = "1" ]; then
+      # gravacao terminou — janela de recuperacao (sistema leva 1-2s pra soltar)
+      was_active=0
+      cset=$(current_topapp_cpus); mask=$(cpus_to_mask "$cset")
+      i=0
+      while [ "$i" -lt 5 ]; do
+        reassert_foreground_affinity "$mask" "$cset"
+        sleep 1; i=$((i+1))
+      done
+      log "recmon: recuperacao pos-gravacao concluida"
+    else
+      sleep 2
+    fi
+  done
+}
+
+start_recmon_if_needed() {
+  # ja rodando?
+  if [ -f "$RECMON_PID" ] && kill -0 "$(cat "$RECMON_PID" 2>/dev/null)" 2>/dev/null; then
+    return 0
+  fi
+  # setsid desacopla o processo da sessao/tty atual (a sessao su do tile), pra
+  # nao interferir no stdout que o RootShell do app esta lendo nem disparar
+  # pedidos de reautorizacao do KernelSU por su concorrente.
+  if command -v setsid >/dev/null 2>&1; then
+    setsid "$0" recmon </dev/null >/dev/null 2>&1 &
+  else
+    nohup "$0" recmon </dev/null >/dev/null 2>&1 &
+  fi
+  log "recmon invocado"
+}
+
+stop_recmon() {
+  [ -f "$RECMON_PID" ] && kill "$(cat "$RECMON_PID" 2>/dev/null)" 2>/dev/null
+  rm -f "$RECMON_PID"
+}
+
+# Pin processos Winlator no cluster gold+prime (cpu3-7) via taskset.
+# Tambem aplica nice -20 e itera threads (TIDs) de cada processo, nao so o PID.
+# DXVK e box64 sao multi-thread; threads novas precisam ser repinadas.
+pin_winlator_procs() {
+  local cpus="$1"  # mascara: "f8" = cpu3-7
+  [ -z "$cpus" ] && return 0
+
+  # 1) Encontra PIDs match
+  pids=$(ps -A -o PID,COMM 2>/dev/null | \
+         awk -v pat="$WINLATOR_PATTERNS" 'tolower($2) ~ tolower(pat) {print $1}')
+  if [ -z "$pids" ]; then
+    pids=$(pgrep -f "$WINLATOR_PATTERNS" 2>/dev/null)
+  fi
+
+  pcount=0
+  tcount=0
+  for pid in $pids; do
+    [ -d "/proc/$pid" ] || continue
+
+    # 2) Pin do PID principal
+    taskset -ap "$cpus" "$pid" >/dev/null 2>&1 && pcount=$((pcount+1))
+
+    # 3) renice -20 (max nice — task entra antes no scheduler)
+    renice -n -20 -p "$pid" >/dev/null 2>&1
+
+    # 4) Iterar TIDs e pinar cada uma (DXVK/box64 sao multi-thread)
+    if [ -d "/proc/$pid/task" ]; then
+      for tid_dir in /proc/$pid/task/*; do
+        tid="${tid_dir##*/}"
+        [ -d "$tid_dir" ] || continue
+        taskset -ap "$cpus" "$tid" >/dev/null 2>&1 && tcount=$((tcount+1))
+      done
+    fi
+  done
+  [ "$pcount" -gt 0 ] && log "pin: $pcount pids ($tcount tids) em cpus=$cpus"
+}
+
+# --- Aplicar um modo ---
+
+load_mode_conf() {
+  local prefix="$1"
+  eval "$(awk -F= -v p="^${prefix}_" '
+    $0 ~ p {
+      key=$1; sub(p, "MCFG_", key)
+      val=$0; sub(/^[^=]*=/, "", val)
+      # escapa aspas simples
+      gsub(/'\''/, "'\''\\'\'\''", val)
+      print key "='\''" val "'\''"
+    }' "$MODES_CONF")"
+}
+
+# sanitize_clocks — zera limitadores dinamicos presos de um modo anterior.
+# Critico para a transicao HIGH->Standard onde o clock "caia e nao subia".
+sanitize_clocks() {
+  log "sanitize_clocks: limpando limitadores dinamicos"
+
+  # 1) dcvsh_freq_limit — limite DCVS de hardware. Setar pro topo de cada cluster
+  #    pra liberar. (read-only em alguns kernels — write_sys silencia falha.)
+  write_sys "2016000" /sys/devices/system/cpu/cpu0/dcvsh_freq_limit
+  write_sys "2803200" /sys/devices/system/cpu/cpu3/dcvsh_freq_limit
+  write_sys "3360000" /sys/devices/system/cpu/cpu7/dcvsh_freq_limit
+
+  # 2) Zerar os cooling devices de throttle de CPU/cluster. Em vez de iterar os
+  #    ~42 cdevs lendo cada 'type' (lento, ~todo tap), cacheamos os caminhos
+  #    relevantes numa 1a passada e reusamos. O cache fica em $CDEV_CACHE.
+  if [ ! -f "$CDEV_CACHE" ]; then
+    : > "$CDEV_CACHE"
+    for cd in /sys/class/thermal/cooling_device*; do
+      [ -e "$cd/type" ] || continue
+      case "$(cat "$cd/type" 2>/dev/null)" in
+        cpufreq-cpu0|cpufreq-cpu3|cpufreq-cpu7|\
+        cpu-cluster0|cpu-cluster1|cpu-cluster2|\
+        thermal-cluster-*|\
+        thermal-pause-*|pause-cpu*)
+          echo "$cd/cur_state" >> "$CDEV_CACHE"
+          ;;
+      esac
+    done
+    log "sanitize_clocks: cache de cdevs criado ($(wc -l < "$CDEV_CACHE") entradas)"
+  fi
+  # Zerar usando o cache (rapido — so escreve, sem ler type)
+  while IFS= read -r cs; do
+    [ -n "$cs" ] && write_sys "0" "$cs"
+  done < "$CDEV_CACHE"
+
+  # 3) Garantir que os cores grandes nao estao offline via core_ctl.
+  write_sys "1" /sys/devices/system/cpu/cpu3/core_ctl/enable
+  write_sys "1" /sys/devices/system/cpu/cpu7/core_ctl/enable
+}
+
+# Restaura scaling_min/max de cada cluster ao range completo de hardware e desliga
+# o boost flag (Performance/High o ligam pro turbo; tem que sair no Standard).
+restore_vendor_clocks() {
+  local p base cmin cmax
+  write_sys "0" /sys/devices/system/cpu/cpufreq/boost
+  write_sys "0" /sys/devices/system/cpu/cpu0/cpufreq/boost 2>/dev/null
+  write_sys "0" /sys/devices/system/cpu/cpu3/cpufreq/boost 2>/dev/null
+  write_sys "0" /sys/devices/system/cpu/cpu7/cpufreq/boost 2>/dev/null
+  for p in 0 3 7; do
+    base="/sys/devices/system/cpu/cpu${p}/cpufreq"
+    cmin=$(cat "${base}/cpuinfo_min_freq" 2>/dev/null)
+    cmax=$(cat "${base}/cpuinfo_max_freq" 2>/dev/null)
+    [ -n "$cmin" ] && write_sys "$cmin" "${base}/scaling_min_freq"
+    [ -n "$cmax" ] && write_sys "$cmax" "${base}/scaling_max_freq"
+  done
+  log "restore_vendor_clocks: boost off + scaling devolvido ao range de fabrica"
+}
+
+# Restaura a GPU de fabrica: libera pwrlevels (devfreq governor manda), desliga
+# forcagens e devolve a janela completa de frequencia.
+restore_vendor_gpu() {
+  local pl_max pl_idle fmin fmax
+  pl_max=$(gpu_pwrlevel_max);  [ -z "$pl_max" ] && pl_max=14
+  pl_idle=$(gpu_pwrlevel_idle); [ -z "$pl_idle" ] && pl_idle=13
+  fmax=$(gpu_freq_list | head -1)
+  fmin=$(gpu_freq_list | tail -1)
+  write_sys "$pl_max" /sys/class/kgsl/kgsl-3d0/min_pwrlevel
+  write_sys "0"       /sys/class/kgsl/kgsl-3d0/max_pwrlevel
+  write_sys "0"       /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel
+  write_sys "$pl_idle" /sys/class/kgsl/kgsl-3d0/default_pwrlevel
+  write_sys "0"       /sys/class/kgsl/kgsl-3d0/force_no_nap
+  write_sys "0"       /sys/class/kgsl/kgsl-3d0/force_clk_on
+  [ -n "$fmin" ] && write_sys "$fmin" /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+  [ -n "$fmax" ] && write_sys "$fmax" /sys/class/kgsl/kgsl-3d0/devfreq/max_freq
+  log "restore_vendor_gpu: GPU devolvida ao governor"
+}
+
+# I/O tuning (valores do Odin): mq-deadline, read_ahead 128, writeback lento,
+# swappiness 60. Melhora responsividade de leitura/escrita. Aplicado em todos os
+# discos reais (ignora loop/ram/zram/dm).
+apply_io_tuning() {
+  local bd name q
+  for bd in /sys/block/*; do
+    name=$(basename "$bd")
+    case "$name" in
+      loop*|ram*|zram*|dm-*|sr*) continue ;;
+    esac
+    q="$bd/queue"
+    [ -d "$q" ] || continue
+    if grep -q "mq-deadline" "$q/scheduler" 2>/dev/null; then
+      write_sys "mq-deadline" "$q/scheduler"
+    fi
+    write_sys "128" "$q/read_ahead_kb"
+  done
+  write_sys "6000"  /proc/sys/vm/dirty_writeback_centisecs
+  write_sys "12000" /proc/sys/vm/dirty_expire_centisecs
+  write_sys "60"    /proc/sys/vm/swappiness
+  log "io_tuning: mq-deadline + read_ahead 128 + writeback 60s + swappiness 60"
+}
+
+apply_mode_values() {
+  local prefix="$1"
+  log "==== aplicando modo: $prefix ===="
+  load_mode_conf "$prefix"
+
+  # Experimental 950MHz: quando ligado E o nivel existe na tabela, limitamos o
+  # teto da GPU a 950MHz no modo HIGH. O 950 pega uma voltagem menor (curva V/F
+  # mais eficiente) que o 1GHz, deixando budget de potencia pra CPU sustentar o
+  # clock — resolve o caso CPU-bound onde o 1GHz "rouba" energia da CPU (BCL).
+  # So afeta o HIGH; nao toca Standard/Perf nem o comportamento stock.
+  if [ "$prefix" = "HIGH" ] && gpu_950_active; then
+    MCFG_GPU_MAX="950000000"
+    log "experimental: teto da GPU limitado a 950MHz (budget pra CPU)"
+  fi
+
+  # pre-build do cache de thermal zones (paga uma vez, vale para tudo)
+  build_zone_cache
+
+  # Saneamento: zera limitadores dinamicos do modo anterior (dcvsh, cdevs de
+  # throttle, pwrlevels) antes de aplicar o novo modo.
+  sanitize_clocks
+
+  # STANDARD = eficiencia: range livre (governor decide, cores dormem) + WALT do
+  # vendor + I/O tunado. Sem pisos de clock (pisos viram trava sob carga).
+  if [ -z "$MCFG_CPU0_MIN$MCFG_CPU0_MAX$MCFG_CPU3_MIN$MCFG_CPU3_MAX$MCFG_CPU7_MIN$MCFG_CPU7_MAX" ]; then
+    restore_vendor_clocks
+    restore_vendor_gpu
+    apply_cpuset "default"
+    apply_bg_cpusets "default"
+    apply_core_ctl ""
+    write_sys "1" /proc/sys/kernel/sched_energy_aware
+    write_sys "1" /proc/sys/kernel/sched_pelt_multiplier
+    write_sys "0" /proc/sys/kernel/sched_util_clamp_min
+    apply_walt_tuning BALANCED
+    apply_io_tuning
+    log "==== modo $prefix aplicado (eficiencia) ===="
+    return 0
+  fi
+
+  # ===== CPU =====
+  apply_cluster 0 "$MCFG_CPU0_MIN" "$MCFG_CPU0_MAX"
+  apply_cluster 3 "$MCFG_CPU3_MIN" "$MCFG_CPU3_MAX"
+  apply_cluster 7 "$MCFG_CPU7_MIN" "$MCFG_CPU7_MAX"
+
+  # ===== GPU =====
+  apply_gpu_lock "$MCFG_GPU_MIN" "$MCFG_GPU_MAX" "$MCFG_GPU_LOCK"
+
+  # ===== DDR =====
+  # NOTE Pocket S: hw_min_freq eh read-only (r--r--r-- no kernel). Usar boost_freq
+  # (gravavel) + memlat min_freq dos clusters gold/prime.
+  if [ -n "$MCFG_DDR_MIN" ]; then
+    write_sys "$MCFG_DDR_MIN" /sys/devices/system/cpu/bus_dcvs/DDR/boost_freq
+    write_sys "$MCFG_DDR_MIN" /sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:gold/min_freq
+    write_sys "$MCFG_DDR_MIN" /sys/devices/system/cpu/bus_dcvs/DDR/soc:qcom,memlat:ddr:prime/min_freq
+    write_sys "$MCFG_DDR_MIN" /sys/devices/system/cpu/bus_dcvs/DDR/24091000.qcom,bwmon-ddr/min_freq
+  fi
+
+  # ===== Sched tunables =====
+  [ -n "$MCFG_SCHED_ENERGY" ]    && write_sys_loud "$MCFG_SCHED_ENERGY"    /proc/sys/kernel/sched_energy_aware
+  [ -n "$MCFG_SCHED_PELT_MULT" ] && write_sys_loud "$MCFG_SCHED_PELT_MULT" /proc/sys/kernel/sched_pelt_multiplier
+
+  if [ "$prefix" = "HIGH" ]; then
+    write_sys_loud "1024" /proc/sys/kernel/sched_util_clamp_min
+  else
+    write_sys "0" /proc/sys/kernel/sched_util_clamp_min
+  fi
+
+  # ===== WALT boost =====
+  if [ -n "$MCFG_WALT_BOOST" ]; then
+    for pol in 0 3 7; do
+      write_sys_loud "$MCFG_WALT_BOOST" /sys/devices/system/cpu/cpufreq/policy${pol}/walt/boost
+    done
+  fi
+  if [ -n "$MCFG_RTG_BOOST" ]; then
+    if [ "$MCFG_RTG_BOOST" = "0" ]; then
+      # desabilitar RTG boost completamente — zerar nos 3 clusters
+      write_sys "0" /sys/devices/system/cpu/cpufreq/policy0/walt/rtg_boost_freq
+      write_sys "0" /sys/devices/system/cpu/cpufreq/policy3/walt/rtg_boost_freq
+      write_sys_loud "0" /sys/devices/system/cpu/cpufreq/policy7/walt/rtg_boost_freq
+    else
+      write_sys "$MCFG_CPU0_MAX" /sys/devices/system/cpu/cpufreq/policy0/walt/rtg_boost_freq
+      write_sys "$MCFG_CPU3_MAX" /sys/devices/system/cpu/cpufreq/policy3/walt/rtg_boost_freq
+      write_sys_loud "$MCFG_RTG_BOOST" /sys/devices/system/cpu/cpufreq/policy7/walt/rtg_boost_freq
+    fi
+  fi
+
+  # ===== Auto-trip =====
+  apply_auto_trips "$MCFG_GPU_TRIP_AUTO" "$MCFG_CPU_TRIP_AUTO"
+
+  # ===== cpuset =====
+  apply_cpuset "$MCFG_TOPAPP_CPUS"
+  apply_bg_cpusets "$MCFG_BG_CPUS"
+
+  # ===== core_ctl =====
+  case "$prefix" in
+    HIGH) apply_core_ctl high ;;
+    PERF) apply_core_ctl perf ;;
+    *)    apply_core_ctl "" ;;
+  esac
+
+  # ===== cdevs =====
+  if [ "$prefix" = "HIGH" ]; then
+    pin_cdevs_zero
+    write_sys "0" /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel
+    write_sys "0" /sys/class/kgsl/kgsl-3d0/default_pwrlevel
+  fi
+
+  # ===== WALT tuning por modo =====
+  apply_walt_tuning "$prefix"
+
+  # ===== I/O tuning (vale em todos os modos — responsividade) =====
+  apply_io_tuning
+
+  log "==== modo $prefix aplicado ===="
+}
+
+# --- Aplicar trips do usuario (sobrescreve auto-trips) ---
+
+apply_thermal_from_conf() {
+  local skin cpu gpu zone
+  skin=$(get_conf $THERMAL_CONF SKIN_TRIP)
+  cpu=$(get_conf $THERMAL_CONF CPU_TRIP)
+  gpu=$(get_conf $THERMAL_CONF GPU_TRIP)
+  build_zone_cache
+
+  # Skin: se ha valor no conf, usa ele; se vazio (Stock), restaura o default OEM
+  # 46500 — senao o vendor deixa o trip num valor alto (95000) apos o boot.
+  zone=$(find_skin_zone)
+  if [ -n "$zone" ]; then
+    strip=$(find_skin_trip "$zone")
+    if [ -n "$strip" ]; then
+      eff_skin="${skin:-46500}"
+      write_sys_loud "$eff_skin" "$strip"
+      log "skin trip = $eff_skin"
+    fi
+  fi
+
+  # CPU user trip — usa cache
+  if [ -n "$cpu" ] && [ -s "$ZONECACHE_CPU" ]; then
+    while IFS= read -r z; do
+      [ -z "$z" ] && continue
+      write_sys "$cpu" "$z/trip_point_1_temp"
+      write_sys "$cpu" "$z/trip_point_2_temp"
+    done < "$ZONECACHE_CPU"
+    log "user cpu trip = $cpu"
+  fi
+
+  # GPU user trip — usa cache
+  if [ -n "$gpu" ] && [ -s "$ZONECACHE_GPU" ]; then
+    while IFS= read -r z; do
+      [ -z "$z" ] && continue
+      write_sys "$gpu" "$z/trip_point_1_temp"
+      write_sys "$gpu" "$z/trip_point_2_temp"
+    done < "$ZONECACHE_GPU"
+    log "user gpu trip = $gpu"
+  fi
+}
+
+# --- WALT tuning por modo ---
+apply_walt_tuning() {
+  local prefix="$1"
+  case "$prefix" in
+    BALANCED)
+      # Governor "criterioso": relutante a subir (up_rate alto, hispeed_load alto,
+      # hispeed_freq baixo) — filtra microcargas do emulador. Foi a config que deu
+      # o menor consumo medido no Pocket (~6555mW, -5% vs vendor).
+      for pol in 0 3 7; do
+        write_sys "40000" /sys/devices/system/cpu/cpufreq/policy${pol}/walt/up_rate_limit_us
+        write_sys "5000"  /sys/devices/system/cpu/cpufreq/policy${pol}/walt/down_rate_limit_us
+        write_sys "99"    /sys/devices/system/cpu/cpufreq/policy${pol}/walt/hispeed_load
+        write_sys "0"     /sys/devices/system/cpu/cpufreq/policy${pol}/walt/boost
+        write_sys "0"     /sys/devices/system/cpu/cpufreq/policy${pol}/walt/rtg_boost_freq
+      done
+      write_sys "1017600" /sys/devices/system/cpu/cpufreq/policy0/walt/hispeed_freq
+      write_sys "1056000" /sys/devices/system/cpu/cpufreq/policy3/walt/hispeed_freq
+      write_sys "1248000" /sys/devices/system/cpu/cpufreq/policy7/walt/hispeed_freq
+      ;;
+    PERF)
+      # Perf: mais agressivo na subida E na manutencao
+      for pol in 0 3 7; do
+        write_sys "0"     /sys/devices/system/cpu/cpufreq/policy${pol}/walt/up_rate_limit_us
+        write_sys "40000" /sys/devices/system/cpu/cpufreq/policy${pol}/walt/down_rate_limit_us
+        write_sys "60"    /sys/devices/system/cpu/cpufreq/policy${pol}/walt/hispeed_load
+      done
+      write_sys "1900800" /sys/devices/system/cpu/cpufreq/policy0/walt/hispeed_freq
+      write_sys "2457600" /sys/devices/system/cpu/cpufreq/policy3/walt/hispeed_freq
+      write_sys "2841600" /sys/devices/system/cpu/cpufreq/policy7/walt/hispeed_freq
+      ;;
+    HIGH)
+      # High: sobe instantaneo, desce devagar, hispeed no topo da tabela regular
+      for pol in 0 3 7; do
+        write_sys "0"     /sys/devices/system/cpu/cpufreq/policy${pol}/walt/up_rate_limit_us
+        write_sys "80000" /sys/devices/system/cpu/cpufreq/policy${pol}/walt/down_rate_limit_us
+        write_sys "50"    /sys/devices/system/cpu/cpufreq/policy${pol}/walt/hispeed_load
+      done
+      write_sys "2016000" /sys/devices/system/cpu/cpufreq/policy0/walt/hispeed_freq
+      write_sys "2707200" /sys/devices/system/cpu/cpufreq/policy3/walt/hispeed_freq
+      write_sys "2956800" /sys/devices/system/cpu/cpufreq/policy7/walt/hispeed_freq
+      ;;
+  esac
+}
+
+# --- Limites manuais de CPU/GPU (sobrescreve config do modo) ---
+
+# apply_user_limits — sobrescreve scaling_min/max e GPU min/max conforme user_limits.conf.
+# Campos vazios = nao mexer (mantem valor do modo).
+# Usado tanto no apply_mode_values quanto reaplicado no keeper.
+# Retorna 0 (true) se ha PELO MENOS um user_limit setado nao-vazio
+has_user_limits() {
+  [ ! -f "$USER_LIMITS_CONF" ] && return 1
+  awk -F= '
+    /^(CPU_(SILVER|GOLD|PRIME)_(MIN|MAX)|GPU_(MIN|MAX))=/ {
+      v = $2; gsub(/^[ \t]+|[ \t]+$/, "", v)
+      if (v != "") { found=1; exit }
+    }
+    END { exit (found ? 0 : 1) }
+  ' "$USER_LIMITS_CONF"
+}
+
+# mode_uses_turbo — retorna 0 (true) se o modo pede frequencia turbo no gold
+# (>=2803200) ou no prime (>=3360000). Usado pra decidir se o keeper precisa
+# rodar em modo "ceiling" (sustentar o turbo sob demanda).
+mode_uses_turbo() {
+  local prefix="$1"
+  local g7 g3
+  g3=$(get_conf "$MODES_CONF" "${prefix}_CPU3_MAX")
+  g7=$(get_conf "$MODES_CONF" "${prefix}_CPU7_MAX")
+  [ "$g3" -ge 2803200 ] 2>/dev/null && return 0
+  [ "$g7" -ge 3360000 ] 2>/dev/null && return 0
+  return 1
+}
+
+apply_user_limits() {
+  [ ! -f "$USER_LIMITS_CONF" ] && return 0
+  local val
+  val=$(get_conf "$USER_LIMITS_CONF" CPU_SILVER_MIN)
+  [ -n "$val" ] && write_sys "$val" /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
+  val=$(get_conf "$USER_LIMITS_CONF" CPU_SILVER_MAX)
+  [ -n "$val" ] && write_sys "$val" /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
+
+  val=$(get_conf "$USER_LIMITS_CONF" CPU_GOLD_MIN)
+  [ -n "$val" ] && write_sys "$val" /sys/devices/system/cpu/cpu3/cpufreq/scaling_min_freq
+  val=$(get_conf "$USER_LIMITS_CONF" CPU_GOLD_MAX)
+  [ -n "$val" ] && write_sys "$val" /sys/devices/system/cpu/cpu3/cpufreq/scaling_max_freq
+
+  val=$(get_conf "$USER_LIMITS_CONF" CPU_PRIME_MIN)
+  [ -n "$val" ] && write_sys "$val" /sys/devices/system/cpu/cpu7/cpufreq/scaling_min_freq
+  val=$(get_conf "$USER_LIMITS_CONF" CPU_PRIME_MAX)
+  [ -n "$val" ] && write_sys "$val" /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq
+
+  val=$(get_conf "$USER_LIMITS_CONF" GPU_MIN)
+  [ -n "$val" ] && write_sys "$val" /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+  val=$(get_conf "$USER_LIMITS_CONF" GPU_MAX)
+  [ -n "$val" ] && write_sys "$val" /sys/class/kgsl/kgsl-3d0/devfreq/max_freq
+}
+
+# show_user_limits — mostra estado atual dos limites
+show_user_limits() {
+  echo "== Limites manuais (user_limits.conf) =="
+  echo "Vazio = usa default do modo atual."
+  echo ""
+  echo "CPU silver (cpu0/policy0):"
+  echo "  MIN:        $(get_conf $USER_LIMITS_CONF CPU_SILVER_MIN)"
+  echo "  MAX:        $(get_conf $USER_LIMITS_CONF CPU_SILVER_MAX)"
+  echo "  ATUAL min:  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq 2>/dev/null)"
+  echo "  ATUAL max:  $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq 2>/dev/null)"
+  echo "  Range HW:   307200 .. 2016000"
+  echo ""
+  echo "CPU gold (cpu3/policy3):"
+  echo "  MIN:        $(get_conf $USER_LIMITS_CONF CPU_GOLD_MIN)"
+  echo "  MAX:        $(get_conf $USER_LIMITS_CONF CPU_GOLD_MAX)"
+  echo "  ATUAL min:  $(cat /sys/devices/system/cpu/cpu3/cpufreq/scaling_min_freq 2>/dev/null)"
+  echo "  ATUAL max:  $(cat /sys/devices/system/cpu/cpu3/cpufreq/scaling_max_freq 2>/dev/null)"
+  echo "  Range HW:   499200 .. 2803200"
+  echo ""
+  echo "CPU prime (cpu7/policy7):"
+  echo "  MIN:        $(get_conf $USER_LIMITS_CONF CPU_PRIME_MIN)"
+  echo "  MAX:        $(get_conf $USER_LIMITS_CONF CPU_PRIME_MAX)"
+  echo "  ATUAL min:  $(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_min_freq 2>/dev/null)"
+  echo "  ATUAL max:  $(cat /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq 2>/dev/null)"
+  echo "  Range HW:   595200 .. 3360000"
+  echo ""
+  echo "GPU (kgsl-3d0):"
+  echo "  MIN:        $(get_conf $USER_LIMITS_CONF GPU_MIN)"
+  echo "  MAX:        $(get_conf $USER_LIMITS_CONF GPU_MAX)"
+  echo "  ATUAL min:  $(cat /sys/class/kgsl/kgsl-3d0/devfreq/min_freq 2>/dev/null)"
+  echo "  ATUAL max:  $(cat /sys/class/kgsl/kgsl-3d0/devfreq/max_freq 2>/dev/null)"
+  echo "  Range HW:   124800000 .. 1000000000"
+}
+
+# reset_user_limits — limpa todos os limites do user_limits.conf
+reset_user_limits() {
+  sed -i 's/^CPU_SILVER_MIN=.*/CPU_SILVER_MIN=/' "$USER_LIMITS_CONF"
+  sed -i 's/^CPU_SILVER_MAX=.*/CPU_SILVER_MAX=/' "$USER_LIMITS_CONF"
+  sed -i 's/^CPU_GOLD_MIN=.*/CPU_GOLD_MIN=/'     "$USER_LIMITS_CONF"
+  sed -i 's/^CPU_GOLD_MAX=.*/CPU_GOLD_MAX=/'     "$USER_LIMITS_CONF"
+  sed -i 's/^CPU_PRIME_MIN=.*/CPU_PRIME_MIN=/'   "$USER_LIMITS_CONF"
+  sed -i 's/^CPU_PRIME_MAX=.*/CPU_PRIME_MAX=/'   "$USER_LIMITS_CONF"
+  sed -i 's/^GPU_MIN=.*/GPU_MIN=/'               "$USER_LIMITS_CONF"
+  sed -i 's/^GPU_MAX=.*/GPU_MAX=/'               "$USER_LIMITS_CONF"
+}
+
+show_thermal() {
+  echo "== Skin =="
+  zone=$(find_skin_zone)
+  if [ -n "$zone" ]; then
+    echo "  zone${zone} (skin-msm-therm)"
+    echo "  temp atual: $(read_sys /sys/class/thermal/thermal_zone${zone}/temp) mC"
+    echo "  trip skin:  $(read_sys "$(find_skin_trip "$zone")") mC"
+  fi
+  echo
+  echo "== CPU (max entre cpu-1-X) =="
+  maxt=0
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -e "$z/type" ] || continue
+    case "$(cat "$z/type" 2>/dev/null)" in
+      cpu-1-*)
+        tt=$(cat "$z/temp" 2>/dev/null)
+        [ -n "$tt" ] && [ "$tt" -gt "$maxt" ] 2>/dev/null && maxt=$tt
+        ;;
+    esac
+  done
+  echo "  maximo: $maxt mC"
+  echo
+  echo "== GPU (max entre gpuss-X) =="
+  maxt=0
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -e "$z/type" ] || continue
+    case "$(cat "$z/type" 2>/dev/null)" in
+      gpuss-*)
+        tt=$(cat "$z/temp" 2>/dev/null)
+        [ -n "$tt" ] && [ "$tt" -gt "$maxt" ] 2>/dev/null && maxt=$tt
+        ;;
+    esac
+  done
+  echo "  maximo: $maxt mC"
+}
+
+# --- RAM Cleaner ---
+
+ram_clean() {
+  log "ram_clean iniciado"
+
+  local mem_before
+  mem_before=$(awk '/MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+
+  # 1) am kill-all libera processos cached que o Android ja considera mataveis
+  am kill-all 2>/dev/null
+
+  # 2) Drop pagecache + dentries + inodes (sync antes pra nao perder writes)
+  sync
+  echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+
+  # 3) Compactacao de memoria
+  echo 1 > /proc/sys/vm/compact_memory 2>/dev/null
+
+  # 4) Swap out paginas idle se zram disponivel
+  if [ -e /sys/block/zram0/writeback ]; then
+    echo idle > /sys/block/zram0/writeback 2>/dev/null
+  fi
+
+  local mem_after
+  mem_after=$(awk '/MemAvailable:/{print $2; exit}' /proc/meminfo 2>/dev/null)
+
+  local freed=0
+  if [ -n "$mem_before" ] && [ -n "$mem_after" ]; then
+    freed=$((mem_after - mem_before))
+    [ "$freed" -lt 0 ] && freed=0
+  fi
+
+  local mb_before=$((mem_before / 1024))
+  local mb_after=$((mem_after / 1024))
+  local mb_freed=$((freed / 1024))
+
+  log "ram_clean ok: antes=${mb_before}MB depois=${mb_after}MB liberado=${mb_freed}MB"
+  echo "antes:    ${mb_before} MB livres"
+  echo "depois:   ${mb_after} MB livres"
+  echo "liberado: ${mb_freed} MB"
+}
+
+# --- Status JSON ---
+
+emit_status() {
+  local mode skin_zone skin_temp skin_trip cpu_max_t gpu_max_t
+  mode=$(cat "$MODEFILE" 2>/dev/null); [ -z "$mode" ] && mode=0
+  skin_zone=$(find_skin_zone)
+  skin_temp=$(read_sys /sys/class/thermal/thermal_zone${skin_zone}/temp)
+  skin_trip=$(read_sys "$(find_skin_trip "$skin_zone")")
+
+  cpu_max_t=0
+  gpu_max_t=0
+  for z in /sys/class/thermal/thermal_zone*; do
+    [ -e "$z/type" ] || continue
+    case "$(cat "$z/type" 2>/dev/null)" in
+      cpu-1-*)
+        tt=$(cat "$z/temp" 2>/dev/null)
+        [ -n "$tt" ] && [ "$tt" -gt "$cpu_max_t" ] 2>/dev/null && cpu_max_t=$tt
+        ;;
+      gpuss-*)
+        tt=$(cat "$z/temp" 2>/dev/null)
+        [ -n "$tt" ] && [ "$tt" -gt "$gpu_max_t" ] 2>/dev/null && gpu_max_t=$tt
+        ;;
+    esac
+  done
+
+  local keeper_running=0
+  if [ -f "$KEEPER_PID" ]; then
+    kp=$(cat "$KEEPER_PID" 2>/dev/null)
+    if [ -n "$kp" ] && kill -0 "$kp" 2>/dev/null; then
+      keeper_running=1
+    fi
+  fi
+
+  # Le trips configurados pelo user
+  local user_skin user_cpu user_gpu
+  user_skin=$(get_conf "$THERMAL_CONF" SKIN_TRIP)
+  user_cpu=$(get_conf "$THERMAL_CONF" CPU_TRIP)
+  user_gpu=$(get_conf "$THERMAL_CONF" GPU_TRIP)
+
+  # Le user_limits
+  local l_silver_min l_silver_max l_gold_min l_gold_max l_prime_min l_prime_max l_gpu_min l_gpu_max
+  l_silver_min=$(get_conf "$USER_LIMITS_CONF" CPU_SILVER_MIN)
+  l_silver_max=$(get_conf "$USER_LIMITS_CONF" CPU_SILVER_MAX)
+  l_gold_min=$(get_conf "$USER_LIMITS_CONF" CPU_GOLD_MIN)
+  l_gold_max=$(get_conf "$USER_LIMITS_CONF" CPU_GOLD_MAX)
+  l_prime_min=$(get_conf "$USER_LIMITS_CONF" CPU_PRIME_MIN)
+  l_prime_max=$(get_conf "$USER_LIMITS_CONF" CPU_PRIME_MAX)
+  l_gpu_min=$(get_conf "$USER_LIMITS_CONF" GPU_MIN)
+  l_gpu_max=$(get_conf "$USER_LIMITS_CONF" GPU_MAX)
+
+  cat <<EOF
+{
+  "mode": ${mode},
+  "keeper": ${keeper_running},
+  "cpu0": {
+    "cur": $(read_sys /sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq),
+    "min": $(read_sys /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq),
+    "max": $(read_sys /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq)
+  },
+  "cpu3": {
+    "cur": $(read_sys /sys/devices/system/cpu/cpu3/cpufreq/scaling_cur_freq),
+    "min": $(read_sys /sys/devices/system/cpu/cpu3/cpufreq/scaling_min_freq),
+    "max": $(read_sys /sys/devices/system/cpu/cpu3/cpufreq/scaling_max_freq)
+  },
+  "cpu7": {
+    "cur": $(read_sys /sys/devices/system/cpu/cpu7/cpufreq/scaling_cur_freq),
+    "min": $(read_sys /sys/devices/system/cpu/cpu7/cpufreq/scaling_min_freq),
+    "max": $(read_sys /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq)
+  },
+  "gpu": {
+    "cur": $(read_sys /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq),
+    "min": $(read_sys /sys/class/kgsl/kgsl-3d0/devfreq/min_freq),
+    "max": $(read_sys /sys/class/kgsl/kgsl-3d0/devfreq/max_freq),
+    "gov": "$(read_sys /sys/class/kgsl/kgsl-3d0/devfreq/governor)"
+  },
+  "thermal": {
+    "skin_temp": ${skin_temp:-0},
+    "skin_trip": ${skin_trip:-0},
+    "cpu_max":   ${cpu_max_t:-0},
+    "gpu_max":   ${gpu_max_t:-0},
+    "user_skin": "${user_skin}",
+    "user_cpu":  "${user_cpu}",
+    "user_gpu":  "${user_gpu}"
+  },
+  "limits": {
+    "silver_min": "${l_silver_min}",
+    "silver_max": "${l_silver_max}",
+    "gold_min":   "${l_gold_min}",
+    "gold_max":   "${l_gold_max}",
+    "prime_min":  "${l_prime_min}",
+    "prime_max":  "${l_prime_max}",
+    "gpu_min":    "${l_gpu_min}",
+    "gpu_max":    "${l_gpu_max}"
+  }
+}
+EOF
+}
+
+# --- Daemon keeper — reaplica modo a cada 1s ---
+
+daemon_loop() {
+  local prefix mode_now
+  mode_now=$(cat "$MODEFILE" 2>/dev/null); [ -z "$mode_now" ] && mode_now=0
+
+  case "$mode_now" in
+    0) prefix=BALANCED ;;
+    1) prefix=PERF ;;
+    2) prefix=HIGH ;;
+    *) return 1 ;;
+  esac
+
+  # keeper_mode define o que o daemon mantem:
+  #   full    -> Performance/High: freqs + cdevs + gpu do modo
+  #   limits  -> quando ha user_limits: so os limites + zera cdevs de throttle
+  #   ceiling -> leve, p/ Standard com turbo: boost + teto + zera throttle, sem
+  #              forcar frequencia (governor decide)
+  local keeper_mode="full"
+  if [ "$(get_conf $MODES_CONF ${prefix}_KEEPER)" != "1" ]; then
+    if has_user_limits; then
+      keeper_mode="limits"
+      log "keeper: modo $prefix sem KEEPER=1, mas user_limits ativos -> mode=limits"
+    elif mode_uses_turbo "$prefix"; then
+      keeper_mode="ceiling"
+      log "keeper: modo $prefix usa turbo -> mode=ceiling (sustenta sob demanda)"
+    else
+      # Sem keeper, sem limits, sem turbo — sai imediatamente (comportamento v2.0.0).
+      rm -f "$KEEPER_PID"
+      return 0
+    fi
+  fi
+
+  echo "$$" > "$KEEPER_PID"
+  log "keeper iniciado pid=$$ modo=$mode_now ($prefix) sleep=200ms keeper_mode=$keeper_mode"
+  trap 'log "keeper recebeu sinal"; rm -f "$KEEPER_PID"; exit 0' INT TERM
+
+  # bulk load — 1 awk em vez de 13
+  load_mode_conf "$prefix"
+
+  # Experimental 950MHz: mesmo override do apply_mode_values, pra o keeper manter
+  # o teto em 950 (e nao reaplicar 1GHz por cima) durante a operacao no HIGH.
+  if [ "$prefix" = "HIGH" ] && gpu_950_active; then
+    MCFG_GPU_MAX="950000000"
+  fi
+
+  # Alias dos MCFG_ para nomes curtos usados no loop
+  local v_cpu0_min="$MCFG_CPU0_MIN" v_cpu0_max="$MCFG_CPU0_MAX"
+  local v_cpu3_min="$MCFG_CPU3_MIN" v_cpu3_max="$MCFG_CPU3_MAX"
+  local v_cpu7_min="$MCFG_CPU7_MIN" v_cpu7_max="$MCFG_CPU7_MAX"
+  local v_gpu_min="$MCFG_GPU_MIN"   v_gpu_max="$MCFG_GPU_MAX"
+  local v_glock="$MCFG_GPU_LOCK"
+  local v_cpus_topapp="$MCFG_TOPAPP_CPUS"
+  local v_ddr="$MCFG_DDR_MIN"
+  local v_gpu_trip="$MCFG_GPU_TRIP_AUTO"
+  local v_cpu_trip="$MCFG_CPU_TRIP_AUTO"
+
+  # Mascara hex pra taskset = cpus do top-app
+  local taskset_mask=""
+  case "$v_cpus_topapp" in
+    3-7) taskset_mask="f8" ;;   # bits 3,4,5,6,7 = 1111_1000 = 0xf8
+    0-7|default|"") taskset_mask="ff" ;;
+  esac
+
+  build_zone_cache
+
+  # Loop adaptativo:
+  #   - GPU: re-aplica a cada tick (200ms) — bate o vendor reset rapido
+  #   - CPU freq: a cada 2 ticks (~400ms) — vendor reseta a ~2s
+  #   - DDR/cpuset: a cada 10 ticks (2s)
+  #   - Pin winlator: a cada 10 ticks (2s) — pgrep eh caro
+  #   - Auto-trips: a cada 50 ticks (10s)
+  #   - default_pwrlevel: a cada 25 ticks (5s)
+  local tick=0
+  local SLEEP_FAST="0.2"   # 200ms — granularidade base
+  while true; do
+    cur_mode=$(cat "$MODEFILE" 2>/dev/null); [ -z "$cur_mode" ] && cur_mode=0
+    if [ "$cur_mode" != "$mode_now" ]; then
+      log "keeper: modo mudou ($mode_now -> $cur_mode), saindo"
+      break
+    fi
+
+    # keeper_mode=limits: modo enxuto pra Standard/Perf COM limites manuais.
+    # So mantemos os limites do usuario + zeramos cdevs de throttle do vendor.
+    # NAO reaplicamos cpuset/walt/freqs-do-modo (que causariam conflito com o
+    # comportamento natural do modo). A cada 1s (5 ticks).
+    if [ "$keeper_mode" = "limits" ]; then
+      if [ $((tick % 5)) -eq 0 ]; then
+        reapply_mtp_fix     # zera cpufreq-cpu3/7, cpu-cluster*, etc
+        apply_user_limits   # reescreve scaling_max/min do usuario
+      fi
+      tick=$((tick + 1))
+      sleep "$SLEEP_FAST"
+      continue
+    fi
+
+    # keeper_mode=ceiling: leve, p/ Standard/Perf que usam turbo sob demanda.
+    # Mantem boost + teto + zera cdevs de throttle (clock nao recai a toa). NAO
+    # forca frequencia — o governor decide a freq instantanea entre min e max.
+    if [ "$keeper_mode" = "ceiling" ]; then
+      if [ $((tick % 2)) -eq 0 ]; then
+        write_sys "1" /sys/devices/system/cpu/cpufreq/boost
+        [ -n "$v_cpu0_max" ] && write_sys "$v_cpu0_max" /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
+        [ -n "$v_cpu0_min" ] && write_sys "$v_cpu0_min" /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
+        [ -n "$v_cpu3_max" ] && write_sys "$v_cpu3_max" /sys/devices/system/cpu/cpu3/cpufreq/scaling_max_freq
+        [ -n "$v_cpu3_min" ] && write_sys "$v_cpu3_min" /sys/devices/system/cpu/cpu3/cpufreq/scaling_min_freq
+        [ -n "$v_cpu7_max" ] && write_sys "$v_cpu7_max" /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq
+        [ -n "$v_cpu7_min" ] && write_sys "$v_cpu7_min" /sys/devices/system/cpu/cpu7/cpufreq/scaling_min_freq
+      fi
+      if [ $((tick % 5)) -eq 0 ]; then
+        reapply_mtp_fix     # zera cdevs de throttle do vendor (clock nao recai a toa)
+        # NOTA: a recuperacao de afinidade durante/apos gravacao de tela e feita
+        # pelo daemon recmon (independente, roda em todos os modos) — nao aqui.
+      fi
+      tick=$((tick + 1))
+      sleep "$SLEEP_FAST"
+      continue
+    fi
+
+    # GPU + cdevs CRITICAL (a cada tick — 200ms) — write_sys eh cheap com skip
+    [ -n "$v_gpu_max" ] && write_sys "$v_gpu_max" /sys/class/kgsl/kgsl-3d0/devfreq/max_freq
+    [ -n "$v_gpu_min" ] && write_sys "$v_gpu_min" /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+    if [ "$v_glock" = "1" ]; then
+      write_sys "0" /sys/class/kgsl/kgsl-3d0/min_pwrlevel
+      write_sys "0" /sys/class/kgsl/kgsl-3d0/max_pwrlevel
+      write_sys "0" /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel
+      write_sys "1" /sys/class/kgsl/kgsl-3d0/force_no_nap
+    fi
+    if [ "$mode_now" = "2" ]; then
+      pin_cdevs_critical
+      write_sys "0" /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel
+      write_sys "0" /sys/class/kgsl/kgsl-3d0/default_pwrlevel
+      # Prime: vendor aperta o teto DCVS sob carga; reaplicamos pra segurar.
+      write_sys "3360000" /sys/devices/system/cpu/cpu7/dcvsh_freq_limit
+      write_sys "1" /sys/devices/system/cpu/cpufreq/boost
+    fi
+
+    # CPU freq — HIGH reaplica a cada tick (carga pesada derruba rapido); outros
+    # modos a cada 2 ticks.
+    if [ "$mode_now" = "2" ] || [ $((tick % 2)) -eq 0 ]; then
+      # Turbo (gold 2803200/prime 3360000) so e aceito com boost ligado; o vendor
+      # pode desliga-lo sob carga. Reaplicamos quando o modo usa turbo.
+      if [ "$v_cpu3_max" -ge 2803200 ] 2>/dev/null || [ "$v_cpu7_max" -ge 3360000 ] 2>/dev/null; then
+        write_sys "1" /sys/devices/system/cpu/cpufreq/boost
+      fi
+      [ -n "$v_cpu0_max" ] && write_sys "$v_cpu0_max" /sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq
+      [ -n "$v_cpu0_min" ] && write_sys "$v_cpu0_min" /sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq
+      [ -n "$v_cpu3_max" ] && write_sys "$v_cpu3_max" /sys/devices/system/cpu/cpu3/cpufreq/scaling_max_freq
+      [ -n "$v_cpu3_min" ] && write_sys "$v_cpu3_min" /sys/devices/system/cpu/cpu3/cpufreq/scaling_min_freq
+      [ -n "$v_cpu7_max" ] && write_sys "$v_cpu7_max" /sys/devices/system/cpu/cpu7/cpufreq/scaling_max_freq
+      [ -n "$v_cpu7_min" ] && write_sys "$v_cpu7_min" /sys/devices/system/cpu/cpu7/cpufreq/scaling_min_freq
+    fi
+
+    # default_pwrlevel — a cada 25 ticks (5s)
+    if [ "$v_glock" = "1" ] && [ $((tick % 25)) -eq 0 ]; then
+      write_sys "0" /sys/class/kgsl/kgsl-3d0/default_pwrlevel
+    fi
+
+    # DDR + cpuset + core_ctl + pause cdevs + user_limits + MTP fix — a cada 10 ticks (2s)
+    if [ $((tick % 10)) -eq 0 ]; then
+      [ -n "$v_ddr" ] && write_sys "$v_ddr" /sys/devices/system/cpu/bus_dcvs/DDR/boost_freq
+      if [ -n "$v_cpus_topapp" ]; then
+        # "default" -> 0-7 (escrever a string literal "default" no sysfs falha)
+        cset="$v_cpus_topapp"; [ "$cset" = "default" ] && cset="0-7"
+        write_sys "$cset" /dev/cpuset/top-app/cpus
+        write_sys "$cset" /dev/cpuset/foreground/cpus
+      fi
+      [ "$mode_now" = "2" ] && reapply_core_ctl_keeper
+      [ "$mode_now" = "2" ] && pin_cdevs_pause
+      apply_user_limits
+      # Fix MTP — independente do modo. Zera cdevs thermal-cluster + dcvsh
+      # que o vendor pode ter alterado ao conectar/desconectar MTP.
+      reapply_mtp_fix
+    fi
+
+    # Pin Winlator — a cada 10 ticks (2s) — pgrep eh caro
+    if [ $((tick % 10)) -eq 0 ] && [ -n "$taskset_mask" ] && [ "$taskset_mask" != "ff" ]; then
+      pin_winlator_procs "$taskset_mask"
+    fi
+
+    # NOTA: a recuperacao de afinidade/cpuset durante e apos gravacao de tela e
+    # feita pelo daemon recmon (independente, roda em todos os modos incl. Standard
+    # sem keeper) — centralizada la pra evitar duplicacao/conflito com o keeper.
+
+    # Re-aplica trips térmicos a cada 50 ticks (10s)
+    if [ $((tick % 50)) -eq 0 ]; then
+      user_skin=$(get_conf $THERMAL_CONF SKIN_TRIP)
+      user_cpu=$(get_conf $THERMAL_CONF CPU_TRIP)
+      user_gpu=$(get_conf $THERMAL_CONF GPU_TRIP)
+
+      eff_cpu="${user_cpu:-$v_cpu_trip}"
+      eff_gpu="${user_gpu:-$v_gpu_trip}"
+      apply_auto_trips "$eff_gpu" "$eff_cpu" 2>/dev/null
+
+      # Skin: usa valor do conf ou restaura default OEM 46500 (Stock) — assim o
+      # vendor nao consegue deixar o trip preso em valor alto.
+      eff_skin="${user_skin:-46500}"
+      zone=$(find_skin_zone)
+      [ -n "$zone" ] && write_sys "$eff_skin" "$(find_skin_trip "$zone")"
+    fi
+
+    tick=$((tick+1))
+    sleep "$SLEEP_FAST"
+  done
+
+  rm -f "$KEEPER_PID"
+  log "keeper finalizado"
+}
+
+stop_keeper() {
+  if [ -f "$KEEPER_PID" ]; then
+    kp=$(cat "$KEEPER_PID" 2>/dev/null)
+    if [ -n "$kp" ] && kill -0 "$kp" 2>/dev/null; then
+      kill "$kp" 2>/dev/null
+      log "keeper antigo (pid=$kp) parado"
+      sleep 1
+    fi
+    rm -f "$KEEPER_PID"
+  fi
+}
+
+start_keeper_if_needed() {
+  local mode_now prefix
+  mode_now=$(cat "$MODEFILE" 2>/dev/null); [ -z "$mode_now" ] && mode_now=0
+  case "$mode_now" in
+    0) prefix=BALANCED ;;
+    1) prefix=PERF ;;
+    2) prefix=HIGH ;;
+    *) return ;;
+  esac
+  # Inicia keeper se: o modo pede (KEEPER=1), OU ha limites manuais ativos
+  # (manter limites contra reverts do vendor mesmo em BALANCED), OU o modo usa
+  # turbo (keeper ceiling sustenta o turbo sob demanda, igual Odin 2).
+  if [ "$(get_conf $MODES_CONF ${prefix}_KEEPER)" = "1" ] || has_user_limits || mode_uses_turbo "$prefix"; then
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$0" daemon </dev/null >/dev/null 2>&1 &
+    else
+      nohup "$0" daemon </dev/null >/dev/null 2>&1 &
+    fi
+    log "keeper invocado para modo $mode_now ($prefix)"
+  fi
+}
+
+# --- Revert ---
+
+do_revert() {
+  log "==== revert ===="
+  stop_keeper
+  stop_recmon
+
+  if [ ! -f "$ORIGFILE" ]; then
+    log "snapshot nao existe"
+    echo 0 > "$MODEFILE"
+    setprop persist.pockets.mode 0
+    return 1
+  fi
+
+  . "$ORIGFILE"
+
+  for p in 0 3 7; do
+    eval "mn=\${CPU${p}_MIN_ORIG}"
+    eval "mx=\${CPU${p}_MAX_ORIG}"
+    if [ -n "$mn" ] && [ -n "$mx" ]; then
+      cpuinfo_min=$(cat /sys/devices/system/cpu/cpu${p}/cpufreq/cpuinfo_min_freq 2>/dev/null)
+      [ -n "$cpuinfo_min" ] && write_sys "$cpuinfo_min" /sys/devices/system/cpu/cpu${p}/cpufreq/scaling_min_freq
+      write_sys_loud "$mx" /sys/devices/system/cpu/cpu${p}/cpufreq/scaling_max_freq
+      write_sys_loud "$mn" /sys/devices/system/cpu/cpu${p}/cpufreq/scaling_min_freq
+    fi
+  done
+
+  # GPU — restaurar completo
+  [ -n "$GPU_MAXPWR_ORIG" ]   && write_sys_loud "$GPU_MAXPWR_ORIG"   /sys/class/kgsl/kgsl-3d0/max_pwrlevel
+  [ -n "$GPU_MINPWR_ORIG" ]   && write_sys_loud "$GPU_MINPWR_ORIG"   /sys/class/kgsl/kgsl-3d0/min_pwrlevel
+  [ -n "$GPU_DEFPWR_ORIG" ]   && write_sys_loud "$GPU_DEFPWR_ORIG"   /sys/class/kgsl/kgsl-3d0/default_pwrlevel
+  [ -n "$GPU_FORCENONAP_ORIG" ] && write_sys_loud "$GPU_FORCENONAP_ORIG" /sys/class/kgsl/kgsl-3d0/force_no_nap
+  [ -n "$GPU_IDLETIMER_ORIG" ]  && write_sys_loud "$GPU_IDLETIMER_ORIG"  /sys/class/kgsl/kgsl-3d0/idle_timer
+  [ -n "$GPU_MIN_ORIG" ] && write_sys_loud "$GPU_MIN_ORIG" /sys/class/kgsl/kgsl-3d0/devfreq/min_freq
+  [ -n "$GPU_MAX_ORIG" ] && write_sys_loud "$GPU_MAX_ORIG" /sys/class/kgsl/kgsl-3d0/devfreq/max_freq
+  [ -n "$GPU_GOV_ORIG" ] && write_sys_loud "$GPU_GOV_ORIG" /sys/class/kgsl/kgsl-3d0/devfreq/governor
+
+  [ -n "$SKIN_TRIP_ORIG" ] && {
+    z=$(find_skin_zone)
+    [ -n "$z" ] && write_sys_loud "$SKIN_TRIP_ORIG" "$(find_skin_trip "$z")"
+  }
+  if [ -n "$GPU_TRIP1_ORIG" ] && [ -n "$GPU_TRIP2_ORIG" ]; then
+    for z in /sys/class/thermal/thermal_zone*; do
+      [ -e "$z/type" ] || continue
+      case "$(cat "$z/type" 2>/dev/null)" in
+        gpuss-*)
+          write_sys "$GPU_TRIP1_ORIG" "$z/trip_point_1_temp"
+          write_sys "$GPU_TRIP2_ORIG" "$z/trip_point_2_temp"
+          ;;
+      esac
+    done
+  fi
+  if [ -n "$CPU_TRIP1_ORIG" ] && [ -n "$CPU_TRIP2_ORIG" ]; then
+    for z in /sys/class/thermal/thermal_zone*; do
+      [ -e "$z/type" ] || continue
+      case "$(cat "$z/type" 2>/dev/null)" in
+        cpu-1-*|cpu-0-*)
+          write_sys "$CPU_TRIP1_ORIG" "$z/trip_point_1_temp"
+          write_sys "$CPU_TRIP2_ORIG" "$z/trip_point_2_temp"
+          ;;
+      esac
+    done
+  fi
+
+  [ -n "$SCHED_EAS_ORIG" ]  && write_sys_loud "$SCHED_EAS_ORIG"  /proc/sys/kernel/sched_energy_aware
+  [ -n "$SCHED_PELT_ORIG" ] && write_sys_loud "$SCHED_PELT_ORIG" /proc/sys/kernel/sched_pelt_multiplier
+
+  # WALT boost off
+  for pol in 0 3 7; do
+    write_sys "0" /sys/devices/system/cpu/cpufreq/policy${pol}/walt/boost
+  done
+
+  # cpuset restaurar
+  [ -n "$TOPAPP_CPUS_ORIG" ]    && write_sys_loud "$TOPAPP_CPUS_ORIG"    /dev/cpuset/top-app/cpus
+  [ -n "$FOREGROUND_CPUS_ORIG" ] && write_sys_loud "$FOREGROUND_CPUS_ORIG" /dev/cpuset/foreground/cpus
+
+  echo 0 > "$MODEFILE"
+  setprop persist.pockets.mode 0
+  log "revert ok"
+}
+
+# --- Dispatch ---
+
+# Logar quem nos chamou (uid + parent process)
+PARENT_PID=$(cat /proc/$$/status 2>/dev/null | awk '/^PPid:/ {print $2}')
+PARENT_NAME=$(cat /proc/${PARENT_PID:-0}/comm 2>/dev/null)
+log "INVOKE: \"$*\" by uid=$(id -u) parent=${PARENT_NAME}($PARENT_PID)"
+
+case "$1" in
+  get)
+    cat "$MODEFILE" 2>/dev/null || echo 0
+    ;;
+  daemon)
+    # keeper — reaplica o modo continuamente (chamado por start_keeper_if_needed)
+    daemon_loop
+    ;;
+  recmon)
+    # monitor de gravacao de tela — restaura cpuset+afinidade do jogo durante e
+    # apos a gravacao (independente do keeper; roda em todos os modos)
+    recmon_loop
+    ;;
+  experimental)
+    # Toggle do suporte experimental ao pwrlevel de 950MHz (requer dtbo flashado
+    # via KonaBess). Uso: perfctl experimental on|off|status
+    case "$2" in
+      on)
+        if ! gpu_has_950; then
+          echo "AVISO: 950MHz nao encontrado na tabela da GPU."
+          echo "Voce precisa flashar o dtbo com o nivel de 950MHz (via KonaBess) antes."
+          echo "O toggle foi ligado mesmo assim, mas so tera efeito quando o 950 existir."
+        fi
+        echo "1" > "$EXPERIMENTAL_FILE"
+        log "experimental: LIGADO (950MHz)"
+        echo "experimental ON"
+        # Reaplica o modo atual pra o 950 entrar em efeito ja
+        m=$(cat "$MODEFILE" 2>/dev/null); case "$m" in 0|1|2) "$0" set "$m" >/dev/null 2>&1 ;; esac
+        ;;
+      off)
+        echo "0" > "$EXPERIMENTAL_FILE"
+        log "experimental: DESLIGADO"
+        echo "experimental OFF"
+        m=$(cat "$MODEFILE" 2>/dev/null); case "$m" in 0|1|2) "$0" set "$m" >/dev/null 2>&1 ;; esac
+        ;;
+      status|"")
+        if experimental_on; then on_s="on"; else on_s="off"; fi
+        if gpu_has_950; then has_s="sim"; else has_s="nao"; fi
+        echo "experimental=$on_s"
+        echo "950_na_tabela=$has_s"
+        if gpu_950_active; then
+          echo "950_ativo=sim (pwrlevel $(gpu_pwrlevel_of_freq 950000000))"
+        else
+          echo "950_ativo=nao"
+        fi
+        ;;
+      *)
+        echo "uso: perfctl experimental on|off|status"
+        ;;
+    esac
+    ;;
+  tile-state)
+    # Estado consolidado pros tiles: PSOK + MODE=0|1|2 + THERMAL=0|1|2|3 (-1 custom).
+    echo "PSOK"
+    m=$(cat "$MODEFILE" 2>/dev/null); case "$m" in 0|1|2) ;; *) m=0 ;; esac
+    echo "MODE=$m"
+    # Determinar preset thermal comparando trips do conf com a tabela.
+    ts=$(get_conf "$THERMAL_CONF" SKIN_TRIP)
+    tc=$(get_conf "$THERMAL_CONF" CPU_TRIP)
+    tg=$(get_conf "$THERMAL_CONF" GPU_TRIP)
+    tp=-1
+    if [ -z "$ts" ] && [ -z "$tc" ] && [ -z "$tg" ]; then
+      tp=0   # tudo vazio = Stock
+    else
+      # presets: idx "skin cpu gpu"
+      for entry in "0 46500 100000 95000" "1 58000 105000 100000" \
+                   "2 68000 108000 105000" "3 78000 110000 110000"; do
+        set -- $entry
+        if [ "$ts" = "$2" ] && [ "$tc" = "$3" ] && [ "$tg" = "$4" ]; then
+          tp="$1"; break
+        fi
+      done
+    fi
+    echo "THERMAL=$tp"
+    # Estado experimental (950MHz) pro app/WebUI: EXP=0|1, GPU950=0|1 (na tabela),
+    # GPU950ACTIVE=0|1 (ligado E presente).
+    if experimental_on; then echo "EXP=1"; else echo "EXP=0"; fi
+    if gpu_has_950; then echo "GPU950=1"; else echo "GPU950=0"; fi
+    if gpu_950_active; then echo "GPU950ACTIVE=1"; else echo "GPU950ACTIVE=0"; fi
+    ;;
+  set)
+    [ -z "$2" ] && { echo "usage: perfctl set 0|1|2" >&2; exit 1; }
+    T_START=$(date +%s%N 2>/dev/null)
+    snapshot_original
+    stop_keeper
+    case "$2" in
+      0) apply_mode_values BALANCED ;;
+      1) apply_mode_values PERF ;;
+      2) apply_mode_values HIGH ;;
+      *) echo "modo invalido: $2" >&2; exit 1 ;;
+    esac
+    apply_thermal_from_conf
+    apply_user_limits
+    echo "$2" > "$MODEFILE"
+    setprop persist.pockets.mode "$2"
+    start_keeper_if_needed
+    start_recmon_if_needed
+    T_END=$(date +%s%N 2>/dev/null)
+    if [ -n "$T_START" ] && [ -n "$T_END" ]; then
+      ELAPSED_MS=$(( (T_END - T_START) / 1000000 ))
+      log "modo $2 aplicado em ${ELAPSED_MS}ms"
+    fi
+    echo "modo $2 aplicado"
+    ;;
+  cycle)
+    # Cicla pro proximo modo (atual+1) e retorna o tile-state no fim — TUDO numa
+    # UNICA invocacao. Pro tile de modos disparar SO 1 comando su (em vez de
+    # ler+aplicar+reler), evitando o throttle de reautorizacao do KernelSU que
+    # causava "Autorize root" so neste tile. Mesma filosofia do thermal (1 run).
+    cur=$(cat "$MODEFILE" 2>/dev/null); case "$cur" in 0|1|2) ;; *) cur=0 ;; esac
+    next=$(( (cur + 1) % 3 ))
+    "$0" set-fast "$next" >/dev/null 2>&1
+    # devolve o estado consolidado (PSOK + MODE=...) pro tile renderizar
+    "$0" tile-state
+    ;;
+  set-fast)
+    # Aplicacao RAPIDA: escreve so o essencial visivel (sanitize + CPU + GPU)
+    # imediatamente, persiste o modo, e dispara o restante (sched/walt/cpuset/
+    # core_ctl/thermal/keeper) em BACKGROUND. O usuario percebe a troca de clock
+    # quase instantaneamente; o refinamento acontece logo depois sem travar a UI.
+    [ -z "$2" ] && { echo "usage: perfctl set-fast 0|1|2" >&2; exit 1; }
+    case "$2" in
+      0) FAST_PREFIX=BALANCED ;;
+      1) FAST_PREFIX=PERF ;;
+      2) FAST_PREFIX=HIGH ;;
+      *) echo "modo invalido: $2" >&2; exit 1 ;;
+    esac
+    T_START=$(date +%s%N 2>/dev/null)
+    stop_keeper
+    load_mode_conf "$FAST_PREFIX"
+    # Experimental 950MHz no HIGH (mesmo override do apply_mode_values/keeper).
+    if [ "$FAST_PREFIX" = "HIGH" ] && gpu_950_active; then
+      MCFG_GPU_MAX="950000000"
+    fi
+    sanitize_clocks
+    # STANDARD: aplica eficiencia ja na parte sincrona (range livre + WALT + I/O).
+    if [ -z "$MCFG_CPU0_MIN$MCFG_CPU0_MAX$MCFG_CPU3_MIN$MCFG_CPU3_MAX$MCFG_CPU7_MIN$MCFG_CPU7_MAX" ]; then
+      restore_vendor_clocks
+      restore_vendor_gpu
+      apply_io_tuning
+      apply_walt_tuning BALANCED
+      echo "$2" > "$MODEFILE"
+      setprop persist.pockets.mode "$2"
+      T_END=$(date +%s%N 2>/dev/null)
+      [ -n "$T_START" ] && [ -n "$T_END" ] && log "set-fast $2: Standard aplicado em $(( (T_END - T_START) / 1000000 ))ms"
+      echo "modo $2 aplicado (fast)"
+      # background completa cpuset/core_ctl/sched + recmon (sessao desacoplada)
+      if command -v setsid >/dev/null 2>&1; then
+        setsid "$0" _bgapply "$2" </dev/null >/dev/null 2>&1 &
+      else
+        "$0" _bgapply "$2" </dev/null >/dev/null 2>&1 &
+      fi
+      exit 0
+    fi
+    apply_cluster 0 "$MCFG_CPU0_MIN" "$MCFG_CPU0_MAX"
+    apply_cluster 3 "$MCFG_CPU3_MIN" "$MCFG_CPU3_MAX"
+    apply_cluster 7 "$MCFG_CPU7_MIN" "$MCFG_CPU7_MAX"
+    apply_gpu_lock "$MCFG_GPU_MIN" "$MCFG_GPU_MAX" "$MCFG_GPU_LOCK"
+    apply_user_limits
+    echo "$2" > "$MODEFILE"
+    setprop persist.pockets.mode "$2"
+    T_END=$(date +%s%N 2>/dev/null)
+    if [ -n "$T_START" ] && [ -n "$T_END" ]; then
+      log "set-fast $2: essencial aplicado em $(( (T_END - T_START) / 1000000 ))ms"
+    fi
+    echo "modo $2 aplicado (fast)"
+    # Resto em background — snapshot, sched, walt, cpuset, core_ctl, cdevs,
+    # thermal, auto-trips, keeper, recmon. CRITICO: roda via setsid numa SESSAO
+    # SEPARADA, senao os processos de background (keeper/recmon, loops infinitos)
+    # herdam o stdout da sessao su do RootShell (do tile) e seguram o pipe aberto
+    # — o RootShell entao nunca ve o fim do comando, trava ate o timeout e
+    # CORROMPE a sessao pros comandos seguintes (readMode falha -> tile mostra
+    # "Autorize root"). setsid + FDs redirecionados resolve.
+    if command -v setsid >/dev/null 2>&1; then
+      setsid "$0" _bgapply "$2" </dev/null >/dev/null 2>&1 &
+    else
+      "$0" _bgapply "$2" </dev/null >/dev/null 2>&1 &
+    fi
+    ;;
+  _bgapply)
+    # Helper interno do set-fast: refinamento de background numa sessao desacoplada
+    # (chamado via setsid). $2 = modo (0|1|2).
+    case "$2" in
+      0) FAST_PREFIX=BALANCED ;;
+      1) FAST_PREFIX=PERF ;;
+      2) FAST_PREFIX=HIGH ;;
+      *) exit 0 ;;
+    esac
+    snapshot_original
+    apply_mode_values "$FAST_PREFIX"
+    apply_thermal_from_conf
+    apply_user_limits
+    start_keeper_if_needed
+    start_recmon_if_needed
+    log "set-fast $2: refinamento background concluido (desacoplado)"
+    ;;
+  status)
+    emit_status
+    ;;
+  thermal)
+    case "$2" in
+      show) show_thermal ;;
+      warmup)
+        # Pre-warm cache de zones (chamado no boot)
+        build_zone_cache
+        ;;
+      set)
+        case "$3" in
+          skin) sed -i "s/^SKIN_TRIP=.*/SKIN_TRIP=$4/" "$THERMAL_CONF" ;;
+          cpu)  sed -i "s/^CPU_TRIP=.*/CPU_TRIP=$4/"   "$THERMAL_CONF" ;;
+          gpu)  sed -i "s/^GPU_TRIP=.*/GPU_TRIP=$4/"   "$THERMAL_CONF" ;;
+          *) echo "usage: perfctl thermal set skin|cpu|gpu TEMP_MC" >&2; exit 1 ;;
+        esac
+        apply_thermal_from_conf
+        ;;
+      reset)
+        sed -i "s/^SKIN_TRIP=.*/SKIN_TRIP=/" "$THERMAL_CONF"
+        sed -i "s/^CPU_TRIP=.*/CPU_TRIP=/"   "$THERMAL_CONF"
+        sed -i "s/^GPU_TRIP=.*/GPU_TRIP=/"   "$THERMAL_CONF"
+        # Tambem restaura trips de HARDWARE aos defaults vendor (caso usuario tenha mudado)
+        # Skin: 46500 mC = default OEM Pocket S
+        zone=$(find_skin_zone)
+        if [ -n "$zone" ]; then
+          write_sys "46500" "$(find_skin_trip "$zone")"
+        fi
+        # CPU clusters (cpu-1-*) e GPU (gpuss-*): defaults vendor
+        for z in /sys/class/thermal/thermal_zone*; do
+          [ -e "$z/type" ] || continue
+          case "$(cat "$z/type" 2>/dev/null)" in
+            cpu-1-*)
+              write_sys "100000" "$z/trip_point_1_temp"
+              write_sys "100000" "$z/trip_point_2_temp"
+              ;;
+            gpuss-*)
+              write_sys "95000"  "$z/trip_point_1_temp"
+              write_sys "95000"  "$z/trip_point_2_temp"
+              ;;
+          esac
+        done
+        log "thermal reset: trips restaurados aos defaults vendor"
+        ;;
+      *) echo "usage: perfctl thermal show|set|reset|warmup" >&2; exit 1 ;;
+    esac
+    ;;
+  limit)
+    case "$2" in
+      show) show_user_limits ;;
+      cpu)
+        # perfctl limit cpu silver_min|silver_max|gold_min|gold_max|prime_min|prime_max VALOR
+        # Aceita tambem aliases: min/max (= gold), silver/gold/prime (= max do cluster)
+        local field="$3" val="$4"
+        case "$field" in
+          silver_min|SILVER_MIN) sed -i "s/^CPU_SILVER_MIN=.*/CPU_SILVER_MIN=$val/" "$USER_LIMITS_CONF" ;;
+          silver_max|SILVER_MAX|silver) sed -i "s/^CPU_SILVER_MAX=.*/CPU_SILVER_MAX=$val/" "$USER_LIMITS_CONF" ;;
+          gold_min|GOLD_MIN|min|MIN)    sed -i "s/^CPU_GOLD_MIN=.*/CPU_GOLD_MIN=$val/" "$USER_LIMITS_CONF" ;;
+          gold_max|GOLD_MAX|gold|max|MAX) sed -i "s/^CPU_GOLD_MAX=.*/CPU_GOLD_MAX=$val/" "$USER_LIMITS_CONF" ;;
+          prime_min|PRIME_MIN) sed -i "s/^CPU_PRIME_MIN=.*/CPU_PRIME_MIN=$val/" "$USER_LIMITS_CONF" ;;
+          prime_max|PRIME_MAX|prime) sed -i "s/^CPU_PRIME_MAX=.*/CPU_PRIME_MAX=$val/" "$USER_LIMITS_CONF" ;;
+          *) echo "usage: perfctl limit cpu silver_max|gold_max|prime_max|gold_min|... VALOR_HZ" >&2; exit 1 ;;
+        esac
+        apply_user_limits
+        echo "limite CPU $field = $val"
+        ;;
+      gpu)
+        local field="$3" val="$4"
+        case "$field" in
+          min|MIN) sed -i "s/^GPU_MIN=.*/GPU_MIN=$val/" "$USER_LIMITS_CONF" ;;
+          max|MAX) sed -i "s/^GPU_MAX=.*/GPU_MAX=$val/" "$USER_LIMITS_CONF" ;;
+          *) echo "usage: perfctl limit gpu min|max VALOR_HZ" >&2; exit 1 ;;
+        esac
+        apply_user_limits
+        echo "limite GPU $field = $val"
+        ;;
+      reset)
+        reset_user_limits
+        # Reaplica o modo atual para restaurar valores default
+        cur_mode=$(cat "$MODEFILE" 2>/dev/null); [ -z "$cur_mode" ] && cur_mode=0
+        case "$cur_mode" in
+          0) apply_mode_values BALANCED ;;
+          1) apply_mode_values PERF ;;
+          2) apply_mode_values HIGH ;;
+        esac
+        echo "limites resetados, modo $cur_mode reaplicado"
+        ;;
+      *) echo "usage: perfctl limit show|cpu|gpu|reset" >&2; exit 1 ;;
+    esac
+    ;;
+  ramclean|ram-clean)
+    ram_clean
+    ;;
+  diag)
+    # Diagnostico — dump do estado atual de freqs + cdevs de throttle.
+    echo "===== CPU scaling ====="
+    for p in 0 3 7; do
+      echo "cpu${p}: min=$(cat /sys/devices/system/cpu/cpu${p}/cpufreq/scaling_min_freq 2>/dev/null) max=$(cat /sys/devices/system/cpu/cpu${p}/cpufreq/scaling_max_freq 2>/dev/null) cur=$(cat /sys/devices/system/cpu/cpu${p}/cpufreq/scaling_cur_freq 2>/dev/null) cpuinfo_max=$(cat /sys/devices/system/cpu/cpu${p}/cpufreq/cpuinfo_max_freq 2>/dev/null)"
+    done
+    echo ""
+    echo "===== dcvsh_freq_limit ====="
+    for p in 0 3 7; do
+      echo "cpu${p}: $(cat /sys/devices/system/cpu/cpu${p}/dcvsh_freq_limit 2>/dev/null)"
+    done
+    echo ""
+    echo "===== cdevs (cur_state != 0) ====="
+    for cd in /sys/class/thermal/cooling_device*; do
+      [ -e "$cd/type" ] || continue
+      s=$(cat "$cd/cur_state" 2>/dev/null)
+      [ "$s" != "0" ] && [ -n "$s" ] && echo "$(cat "$cd/type" 2>/dev/null) = $s"
+    done
+    echo ""
+    echo "===== GPU ====="
+    echo "devfreq min=$(cat /sys/class/kgsl/kgsl-3d0/devfreq/min_freq 2>/dev/null) max=$(cat /sys/class/kgsl/kgsl-3d0/devfreq/max_freq 2>/dev/null) cur=$(cat /sys/class/kgsl/kgsl-3d0/devfreq/cur_freq 2>/dev/null)"
+    echo "pwrlevel min=$(cat /sys/class/kgsl/kgsl-3d0/min_pwrlevel 2>/dev/null) max=$(cat /sys/class/kgsl/kgsl-3d0/max_pwrlevel 2>/dev/null) thermal=$(cat /sys/class/kgsl/kgsl-3d0/thermal_pwrlevel 2>/dev/null) default=$(cat /sys/class/kgsl/kgsl-3d0/default_pwrlevel 2>/dev/null)"
+    echo "force_no_nap=$(cat /sys/class/kgsl/kgsl-3d0/force_no_nap 2>/dev/null) force_clk_on=$(cat /sys/class/kgsl/kgsl-3d0/force_clk_on 2>/dev/null) idle_timer=$(cat /sys/class/kgsl/kgsl-3d0/idle_timer 2>/dev/null)"
+    echo ""
+    echo "===== Estado modulo ====="
+    echo "modo: $(cat $MODEFILE 2>/dev/null)"
+    echo "keeper rodando: $([ -f "$KEEPER_PID" ] && echo "sim (pid $(cat $KEEPER_PID))" || echo nao)"
+    echo "user_limits ativos: $(has_user_limits && echo sim || echo nao)"
+    ;;
+  revert)
+    do_revert
+    ;;
+  *)
+    cat <<EOF
+Pocket S Performance Control
+by kirimu
+
+Uso:
+  perfctl get                       imprime modo atual (0/1/2)
+  perfctl set 0|1|2                 aplica modo
+  perfctl status                    JSON do estado
+  perfctl thermal show              imprime trips atuais
+  perfctl thermal set <s|c|g> TEMP_MC
+  perfctl thermal reset
+  perfctl limit show                imprime limites manuais
+  perfctl limit cpu <field> <val>
+  perfctl limit gpu min|max <val>
+  perfctl limit reset
+  perfctl ramclean                  limpa RAM cached
+  perfctl revert                    restaura snapshot original
+
+Modos:
+  0 = Standard
+  1 = Performance
+  2 = High Performance
+EOF
+    ;;
+esac

@@ -1,0 +1,7 @@
+id=pockets_perfcontrol
+name=Pocket S Performance Control
+version=v2.4.9
+versionCode=2409
+author=kirimu
+description=Controle de desempenho e temperatura para AYANEO Pocket S (SM8550). Tres modos (Standard/Performance/High), presets termicos ajustaveis, limites de clock por nucleo, tuning de I/O, RAM cleaner, 3 tiles de Quick Settings e WebUI bilingue. Reversivel.
+updateJson=

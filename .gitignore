@@ -1,0 +1,21 @@
+# Arquivos de build / temporários
+*.log
+*.tmp
+*.bak
+*~
+
+# Estado de runtime (gerado no device, não versionar)
+current_mode
+*.cache
+
+# Artefatos de empacotamento
+*.zip
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Keystores e segredos (NUNCA versionar)
+*.keystore
+*.jks
+debug.keystore
