@@ -214,7 +214,7 @@ perfctl revert             undo everything and restore factory state
 
 ## Requirements
 
-- AYANEO Pocket S (82758275) · KernelSU · Android 13
+- AYANEO Pocket S (SG8275) · KernelSU · Android 13
 
 ---
 
